@@ -648,19 +648,112 @@ def memory_flags(mode, native_review=False):
 FINAL_MESSAGE_CONTRACT = (
     "FINAL MESSAGE CONTRACT: Your final message is read by another agent. If the brief specifies an exact reply format "
     "or exact reply text, follow the brief and ignore the headings below. Otherwise report as long as needed but dense "
-    "(soft target 40 lines or fewer), under these fixed headings: Outcome; Changes (every path); "
-    "Verification (each check with the command and its real exit code/result); Problems and deviations "
-    "(anything that failed, was skipped, was assumed, or differs from the brief); Open questions/decisions for the user. "
+    "(soft target 40 lines or fewer), under these fixed headings in this order: Outcome; Problems and deviations "
+    "(anything that failed, was skipped, was assumed, or differs from the brief); Open questions/decisions for the user; "
+    "Changes (every path); Verification (each check with the command and its real exit code/result). "
     "Never omit failures or deviations to save space. No logs, no file contents, no restating the task."
 )
 
 
+HEADING_RE = re.compile(
+    r"^(?:#{1,6}\s+\S.*|\*\*[^*\n]{1,80}\*\*:?"
+    r"|(?:Outcome|Changes|Verification|Problems and deviations|Open questions(?:/decisions)?(?: for the user)?|Summary)"
+    r"(?:\s*\([^)]*\))?\s*:?)\s*$", re.I)
+CRITICAL_RE = re.compile(
+    r"outcome|summary|problem|deviation|question|decision|risk|block|fail|warn|limitation|assum|skip|unfinish|"
+    r"incomplete|caveat|结果|问题|偏差|待决|待定|风险|失败|警告|假设|跳过|未完成|遗留", re.I)
+STUB_RESERVE = 140
+
+
+def _heading_title(line):
+    return re.sub(r"^#{1,6}\s+|\*\*|:\s*$", "", line.strip()).strip(" :*")
+
+
+def split_sections(text):
+    """[(title or None, block)] where each block starts at its heading line. Text before the first heading has no title."""
+    sections, title, lines = [], None, []
+    for line in text.split("\n"):
+        if HEADING_RE.match(line.strip()):
+            if "".join(lines).strip():
+                sections.append((title, "\n".join(lines)))
+            title, lines = _heading_title(line), [line]
+        else:
+            lines.append(line)
+    if "".join(lines).strip():
+        sections.append((title, "\n".join(lines)))
+    return sections
+
+
+def _head_tail(text, budget):
+    """Keep the start and the end, cut the middle at line boundaries. Returns (text, omitted_chars)."""
+    if len(text) <= budget:
+        return text, 0
+    lines = text.split("\n")
+    head, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > int(budget * 0.6):
+            break
+        head.append(line)
+        used += len(line) + 1
+    tail, tail_used = [], 0
+    for line in reversed(lines[len(head):]):
+        if tail_used + len(line) + 1 > int(budget * 0.3):
+            break
+        tail.append(line)
+        tail_used += len(line) + 1
+    tail.reverse()
+    last = next((ln for ln in reversed(lines) if ln.strip()), "")
+    if last and last not in tail and len(lines) > len(head) and len(last) <= budget // 2:
+        tail = [last]  # the final line is where caveats and warnings tend to be: always keep it when it fits
+        tail_used = len(last) + 1
+    if not head and not tail:  # one enormous line: keep both ends of it
+        a, z = int(budget * 0.6), int(budget * 0.3)
+        omitted = max(len(text) - a - z, 0)
+        return text[:a] + f"\n[... {omitted} chars omitted from the middle ...]\n" + text[len(text) - z:], omitted
+    omitted = max(len(text) - used - tail_used, 0)
+    return "\n".join(head + [f"[... {omitted} chars omitted from the middle; they may hold important details ...]"] + tail), omitted
+
+
 def brief_text(text, limit):
+    """Cap Codex's final message without losing what matters. Returns (summary, omitted_chars).
+    Structured reports keep the critical sections (outcome, problems, deviations, open questions) whole and
+    drop or trim the bulky ones (changes, verification) first, leaving a stub that names what was left out.
+    Unstructured text keeps its head AND its tail, because the end is often where the caveats are."""
     if len(text) <= limit:
         return text, 0
-    boundary = text.rfind("\n", 0, limit + 1)
-    summary = text[:boundary].rstrip("\r") if boundary >= 0 else ""
-    return summary, len(text) - len(summary)
+    sections = split_sections(text)
+    titled = [i for i, (t, _) in enumerate(sections) if t]
+    if len(titled) < 2:
+        return _head_tail(text, limit)
+    first = titled[0]
+    critical = [i for i, (t, _) in enumerate(sections) if t is None or i == first or CRITICAL_RE.search(t)]
+    others = [i for i in range(len(sections)) if i not in critical]
+    kept, omitted = {}, 0
+    crit_budget = max(limit - STUB_RESERVE * len(others), limit // 2)
+    if sum(len(sections[i][1]) for i in critical) <= crit_budget:
+        for i in critical:
+            kept[i] = sections[i][1]
+    else:
+        share = max(crit_budget // len(critical), 200)
+        for i in critical:
+            kept[i], cut = _head_tail(sections[i][1], share)
+            omitted += cut
+    avail = limit - sum(len(v) for v in kept.values())
+    for pos, i in enumerate(others):
+        title, block = sections[i]
+        after = len(others) - pos - 1
+        room = avail - STUB_RESERVE * after
+        if len(block) <= room:
+            kept[i] = block
+            avail -= len(block)
+        elif room >= 350:
+            kept[i], cut = _head_tail(block, room)
+            omitted += cut
+            avail -= len(kept[i])
+        else:
+            kept[i] = f'[omitted section "{title}" ({len(block)} chars); get it with: result --section "{title}"]'
+            omitted += len(block)
+    return "\n".join(kept[i] for i in range(len(sections))), omitted
 
 
 def event_notice(event):
@@ -1631,8 +1724,18 @@ def cmd_result(a):
     jid = _resolve_job(a.job, getattr(a, "name", None)); st = _refresh(jid)
     if st["status"] in ACTIVE:
         print(f"job {jid} still running"); return
-    if getattr(a, "full", False):
-        path = Path(_job_path(jid, "result.txt"))
+    wanted = getattr(a, "section", None)
+    path = Path(_job_path(jid, "result.txt"))
+    if wanted:
+        text = path.read_text() if path.exists() else ""
+        secs = split_sections(text)
+        hits = [block for title, block in secs if title and wanted.lower() in title.lower()]
+        if hits:
+            print("\n\n".join(hits))
+        else:
+            names = [title for title, _ in secs if title]
+            print(f'no section matching "{wanted}"; available: ' + (", ".join(names) if names else "(the result has no headings; use --full)"))
+    elif getattr(a, "full", False):
         print(path.read_text() if path.exists() else st.get("error", ""))
     else:
         print_brief(jid)
@@ -1645,7 +1748,7 @@ def cmd_wait(a):
         if time.time() - t0 > a.timeout:
             print(f"job {jid} still running after {a.timeout}s"); return
         time.sleep(3)
-    cmd_result(argparse.Namespace(job=jid, full=getattr(a, "full", False)))
+    cmd_result(argparse.Namespace(job=jid, full=getattr(a, "full", False), section=getattr(a, "section", None)))
 
 
 def legacy_process(jid, st):
@@ -2043,7 +2146,9 @@ def main():
         if n == "attach": q.add_argument("--force", action="store_true")
     for n in ("result", "cancel", "wait"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
-        if n in ("result", "wait"): q.add_argument("--full", action="store_true", help="print the full saved result instead of a capped summary")
+        if n in ("result", "wait"):
+            q.add_argument("--full", action="store_true", help="print the full saved result instead of a capped summary")
+            q.add_argument("--section", metavar="NAME", help="print only the report section whose heading contains NAME")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
     steer = sub.add_parser("steer", help="interrupt safely and guide the same session (background by default)")
     steer.add_argument("job", nargs="?", default="last")

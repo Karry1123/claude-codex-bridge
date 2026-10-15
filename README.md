@@ -80,9 +80,9 @@ Jobs longer than about 30 seconds go to the background on their own. For big or 
 
 ## What Claude gets back
 
-After a run Claude receives a compact report, not the log: a header with status, exit code, job and session; Codex's final message, capped at `brief_chars` and cut at a line boundary with the exact command for the full text; and an `activity` block of facts the bridge collects itself, so a sloppy summary cannot hide a problem: every touched file, each failed command with its exit code and last output lines, error and warning events, timeouts, sub-agent count, tokens and quota. Codex is asked to write its final message as Outcome, Changes, Verification, Problems and deviations, and Open questions, unless the brief specifies its own reply format.
+After a run Claude receives a compact report, not the log: a header with status, exit code, job and session; Codex's final message, capped at `brief_chars` without losing what matters (problems, deviations and open questions are always kept whole; bulky sections such as Changes or Verification are trimmed or replaced by a stub that says how to fetch them; unstructured text keeps both its start and its end); and an `activity` block of facts the bridge collects itself, so a sloppy summary cannot hide a problem: every touched file, each failed command with its exit code and last output lines, error and warning events, timeouts, sub-agent count, tokens and quota. Codex is asked to write its final message as Outcome, Changes, Verification, Problems and deviations, and Open questions, unless the brief specifies its own reply format.
 
-Nothing is dumped to stderr. Claude pulls detail only when needed: `result --full`, `log --failed`, `log --commands`, `log --grep PATTERN`. `--live` prints the timeline for people running the bridge by hand.
+Nothing is dumped to stderr. Claude pulls detail only when needed: `result --section NAME`, `result --full`, `log --failed`, `log --commands`, `log --grep PATTERN`. `--live` prints the timeline for people running the bridge by hand.
 
 ## Sub-agents
 

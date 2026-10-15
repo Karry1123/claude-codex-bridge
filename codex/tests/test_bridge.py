@@ -1185,7 +1185,7 @@ class BridgeTests(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertEqual(lines[0], "codex done exit=0 job=" + jid + " session=output-thread")
         summary, more = b.brief_text(final, 80)
-        self.assertEqual(summary, final[:76])
+        self.assertIn("omitted from the middle", summary)  # unstructured text keeps head and tail, marks the middle
         self.assertIn("summary: " + summary + "\n... [" + str(more) + " more chars; full text: " + b.bridge_command("result", jid, "--full").replace(str(self.home), os.path.realpath(self.home)) + "]", result.stdout)
         self.assertTrue(any(line.startswith("activity: ") for line in lines))
         self.assertLess(len(result.stdout.encode()), 2000)
@@ -1351,7 +1351,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("poll `status <id> --json`", doc)
         self.assertNotIn("poll `log", doc)
         self.assertNotIn("do NOT run `log`, `result --full`", doc)
-        self.assertIn("truncation marker", doc)
+        self.assertIn("omitted from the middle", doc)
+        self.assertIn("result <id> --section", doc)
         self.assertIn("cross-check", doc)
         self.assertIn("never declare success", doc)
         self.assertIn("--subagents active", doc)
@@ -1360,10 +1361,10 @@ class BridgeTests(unittest.TestCase):
 
     def test_a1_line_boundary_and_a2_dense_contract(self):
         self.assertEqual(b.DEFAULTS["brief_chars"], 4000)
-        self.assertEqual(b.brief_text("one\ntwo\nthree", 6), ("one", 10))
-        self.assertEqual(b.brief_text("one\n\ntwo", 6), ("one\n", 4))
-        self.assertEqual(b.brief_text("a very long single line", 3), ("", 23))
         self.assertEqual(b.brief_text("abc", 3), ("abc", 0))
+        text, omitted = b.brief_text("one\ntwo\nthree\nfour\nfive\nsix", 12)
+        self.assertGreater(omitted, 0)
+        self.assertTrue(text.startswith("one") and text.endswith("six"))  # head AND tail survive
         self.output_fake("done")
         result = self.bridge_cli("run", "go")
         self.assertLess(len(result.stdout.encode()), 2000)
@@ -1438,6 +1439,72 @@ class BridgeTests(unittest.TestCase):
     def test_contract_yields_to_an_explicit_reply_format(self):
         self.assertIn("follow the brief and ignore the headings", b.FINAL_MESSAGE_CONTRACT)
         self.assertIn("exact reply format", b.FINAL_MESSAGE_CONTRACT)
+
+    REPORT = None
+
+    def _long_report(self):
+        files = "\n".join("- src/module_%02d.py: refactored handle_%d() and updated its callers" % (i, i) for i in range(1, 31))
+        checks = "\n".join("- `pytest tests/test_%02d.py` exit 0, %d passed" % (i, 10 + i) for i in range(1, 21))
+        return ("### Outcome\nPartly done. 29 of 30 modules migrated; module_17 could NOT be migrated.\n\n"
+                "### Changes (every path)\n" + files + "\n\n### Verification\n" + checks + "\n\n"
+                "### Problems and deviations\n- module_17.py was NOT migrated: undocumented private cache format.\n"
+                "- handle_5() gained a required argument which breaks external callers.\n\n"
+                "### Open questions/decisions for the user\n- Should handle_5() keep a default argument?\n"
+                "- Who owns the cache file format used by module_17?\n")
+
+    def test_brief_keeps_critical_sections_and_stubs_bulky_ones(self):
+        report = self._long_report()
+        text, omitted = b.brief_text(report, 1500)
+        self.assertLess(len(report), 4000)
+        self.assertLessEqual(len(text), 1500)
+        self.assertGreater(omitted, 0)
+        for needle in ("module_17 could NOT be migrated", "module_17.py was NOT migrated", "breaks external callers",
+                       "Who owns the cache file format", "Should handle_5() keep a default argument"):
+            self.assertIn(needle, text)  # outcome, problems, deviations and open questions are never cut
+        self.assertIn('omitted section "Verification"', text)  # bulky section replaced by a stub that says how to fetch it
+        self.assertIn('result --section "Verification"', text)
+        self.assertNotIn("src/module_17.py", text)  # the file list is trimmed in the middle (also reported mechanically)
+        self.assertIn("omitted from the middle", text)
+
+    def test_brief_unstructured_text_keeps_its_last_lines(self):
+        body = "\n".join("line %d: routine progress note" % i for i in range(1, 80))
+        text, omitted = b.brief_text(body + "\nWARNING at the very end: the migration is NOT idempotent.", 500)
+        self.assertIn("NOT idempotent", text)
+        self.assertIn("line 1:", text)
+        self.assertIn("omitted from the middle", text)
+        self.assertGreater(omitted, 0)
+        one_line, cut = b.brief_text("x" * 3000, 300)  # one enormous line: both ends survive
+        self.assertTrue(one_line.startswith("xxx") and one_line.endswith("xxx") and cut > 2000)
+
+    def test_critical_sections_larger_than_the_cap_are_trimmed_but_still_present(self):
+        big = "\n".join("- problem detail %03d" % i for i in range(200))
+        report = "### Outcome\nfailed\n\n### Changes\n- a.py\n\n### Problems and deviations\n" + big + "\n\n### Open questions\n- one question?\n"
+        text, _ = b.brief_text(report, 800)
+        self.assertIn("failed", text)
+        self.assertIn("one question?", text)
+        self.assertIn("problem detail 000", text)
+        self.assertIn("problem detail 199", text)  # head and tail of the oversized critical section
+
+    def test_result_section_retrieves_only_what_was_asked(self):
+        r = b.exec_codex(self.cfg(), "go", str(self.cwd)) if False else None
+        jid = b.new_run("task", self.cfg(), "go", str(self.cwd))
+        Path(b._job_path(jid, "result.txt")).write_text(self._long_report())
+        b._jwrite(jid, status="done")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            b.cmd_result(argparse.Namespace(job=jid, name=None, full=False, section="verif"))
+        self.assertIn("pytest tests/test_20.py", out.getvalue())
+        self.assertNotIn("Problems and deviations", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            b.cmd_result(argparse.Namespace(job=jid, name=None, full=False, section="nonsense"))
+        self.assertIn("no section matching", out.getvalue())
+        self.assertIn("Problems and deviations", out.getvalue())  # lists what is available
+
+    def test_contract_puts_problems_before_bulky_sections(self):
+        c = b.FINAL_MESSAGE_CONTRACT
+        self.assertLess(c.index("Problems and deviations"), c.index("Changes (every path)"))
+        self.assertLess(c.index("Open questions"), c.index("Verification"))
 
 
 if __name__ == "__main__":
