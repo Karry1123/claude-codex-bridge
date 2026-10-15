@@ -5,15 +5,15 @@ allowed-tools: mcp__terminal__run_in_terminal, mcp__terminal__stop_terminal_tab,
 disable-model-invocation: true
 ---
 
-Handle $ARGUMENTS. Choose role/model/effort/sandbox and execution mode yourself; ask at most one question only if the goal is ambiguous. Invoke the executable directly, with its path quoted. Use this template, replacing the label, role, flags and brief as needed:
+Handle $ARGUMENTS. Choose role/model/effort/sandbox, sub-agent dispatch and execution mode yourself; ask at most one question only if the goal is ambiguous. Invoke the executable directly, with its path quoted. Use this template, replacing the label, role, flags and brief as needed:
 
 ```sh
-"${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run --name task-label --role worker --background - <<'PROMPT'
+"${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run --name task-label --role worker --subagents auto --background - <<'PROMPT'
 Goal: describe the task.
 Context: paths and known facts.
 Do / Don't touch: scope and constraints.
 Done when: exact check command.
-Reply with: files changed and real check result, at most 10 lines.
+Reply with: dense report under Outcome; Changes (every path); Verification (commands and real results); Problems and deviations; Open questions/decisions for the user. Never omit problems to save space.
 PROMPT
 ```
 
@@ -24,16 +24,18 @@ Every invocation refreshes `~/.claude/codex-bridge/bin/codex_bridge.py`, a stabl
 - Bug/stuck: `run --role debugger`; build/edit/refactor: worker; find/explain: explorer; design: architect. Explorer/reviewer/architect are read-only; worker/debugger follow configured sandbox.
 - One need = one `run --name <label>` session. Same label gets or creates that session in this directory; unrelated needs use new labels. `--continue` resumes the newest task session here. Model/effort and sandbox are inherited; concurrent runs on one session are refused.
 - Independent needs with disjoint files can use separate `--background` sessions or `parallel tasks.json` (JSON task list, configured `max_parallel`, default 4). Dependent steps run in order: explorer → worker → reviewer. Never let two runs write the same files.
-- Bulk work uses ONE sol medium lead which fans out up to 20 luna sub-agents; let the lead split it. Split sessions when needs differ.
+- Bulk work uses `--subagents active`: ONE sol medium lead fans out up to 20 luna sub-agents; let the lead split it. Split sessions when needs differ.
 - Very simple tasks: do them yourself unless the user explicitly requests Codex (including “强制用 codex”). Simple means most of: ≤2 files / ~15 changed lines, no test-fix loop, a minute's work, quick lookup/explanation, or needs this chat's context. Say “这个很小，我直接做了，没转给 Codex；可说‘强制用 codex’”. Delegate big, slow, parallel work, long reading, test/fix loops, and independent second opinions.
 
+- Choose and pass `--subagents` explicitly for every task: `--subagents active` for large work that splits independently (roughly 10+ similar items, several independent modules/directories, broad multi-area recon or review); `--subagents none` for small, serial, tightly coupled, order-dependent work, shared-file edits, or one coherent design; otherwise `--subagents auto`. `--max-subagents N` limits concurrency to 1..20 (default 20). These are prompt controls, not model/effort locks; they may change on resume or steer. For review needing per-call dispatch, use `run --role reviewer --subagents active` with an explicit review brief; native `review` cannot carry the control and warns when configured none/active is ignored.
+
 ## Choose once, then lock
-Assess difficulty before the first call; state your model/effort and reason in one line. Defaults are configurable. Pass overrides only when departing from role defaults or honoring an explicit user choice.
+Assess difficulty before the first call; state your model/effort, sub-agent mode and reason in one line. Defaults are configurable. Pass overrides only when departing from role defaults or honoring an explicit user choice.
 
 | Task | Model / effort |
 |---|---|
 | Ordinary build/edit/refactor/recon/explain | gpt-6.1-sol medium |
-| Repetitive bulk edits/transforms/extraction/checks (~10+ independent items) | sol medium lead → up to 20 gpt-6-luna sub-agents, high (xhigh for subtle items); or parallel luna tasks |
+| Repetitive bulk edits/transforms/extraction/checks (~10+ independent items) | `--subagents active`: sol medium lead → up to 20 gpt-6-luna sub-agents, high (xhigh for subtle items); or parallel luna tasks |
 | Design, tricky logic, ambiguity, sensitive data/migrations/security, hard debugging | gpt-6-astra medium; high if genuinely hard |
 | Review | gpt-6-astra high; adversarial same or xhigh if very risky |
 | Intricate concurrency/algorithms/major architecture | xhigh rarely; explain why |
@@ -45,11 +47,12 @@ Within one session NEVER switch model or effort (prompt cache); all resume paths
   1. If `mcp__terminal__run_in_terminal` is not callable, it is a deferred tool: load it first with ToolSearch, query `select:mcp__terminal__run_in_terminal`. Never conclude "no terminal tool" without trying this.
   2. Call it with `command` = the printed `watch` line (normally `~/.claude/codex-bridge/bin/codex_bridge.py watch <id>`; one ASCII line, no `cwd`, `title` = a short label such as "Codex: <task>"). Open one tab per background job, every time, including when an earlier tab exists. With a custom bridge home, use the printed command with its `CODEX_BRIDGE_HOME=...` prefix.
   3. When the job finishes, close that tab (`mcp__terminal__stop_terminal_tab` with `close: true`) so the pane does not pile up.
-  4. Only if the tool truly does not exist or is denied: say so and give the user the exact `watch` command to run in their own terminal; then relay progress yourself with `log <id> --since`.
-- No terminal tool: poll `log <id> --since 0`, then use each printed next cursor as `--since`; `status <id> --json` gives compact state. `log <id> --tail N` gives bounded history; `--full` expands details. Relay 1–2 plain lines at checkpoints, not raw logs.
-- Progress → watch; replay → log; stop → `cancel <id>` then inspect `git status`; result → `wait <id>` then `result <id>`; takeover → `attach <id>` and give its quoted resume line. Attach refuses active jobs unless `--force`; normally cancel/wait first. Supervision defaults to newest job in this directory, with a printed notice on global fallback; `--name <label>` selects a local label.
+  4. Only if the tool truly does not exist or is denied: say so and give the user the exact `watch` command to run in their own terminal; then relay progress yourself with `status <id> --json`.
+- No terminal tool: poll `status <id> --json` for compact state, summary and exit code. Relay 1–2 plain lines at checkpoints, not raw logs.
+- Progress → watch; requested replay → log; stop → `cancel <id>` then inspect `git status`; result → `wait <id>` (brief by default); takeover → `attach <id>` and give its quoted resume line. Attach refuses active jobs unless `--force`; normally cancel/wait first. Supervision defaults to newest job in this directory, with a printed notice on global fallback; `--name <label>` selects a local label.
 - Corrections / guidance while Codex is working (including after watching the live pane): `steer <id> "<message>"` or `steer --name <label> "<message>"`. This interrupts the step in progress, stops its tools, and resumes the SAME session with the guidance; it is not mid-turn message injection. NEVER cancel and start a new session just to correct or redirect. Resumed sessions keep their full configured sandbox, network access and .git write capability since 0.8.0, so continuing the same session is correct for commit/network work too. New sessions are only for unrelated needs, fresh-eyes review, or escalation after failed verification. Steer defaults to background (open its new watch pane); `--foreground` runs inline, and `-` reads guidance from stdin.
 - Big/risky work (many files, deletion/renaming, migration, hard to undo, or requested plan): architect first, show plan, ask approve/adjust using AskUserQuestion if available, otherwise normal chat. Existing authorization or “直接做” permits proceeding. Use authorized file/Git/test tools for direct work and verification; if unavailable, report the limitation.
+- Reporting: use the brief output (default 4000 characters, cut only between lines) and cross-check Codex's prose against the mechanical activity block, especially failed commands or touched files absent from the prose. Retrieve targeted details whenever anything looks missing or ambiguous: `log <id> --failed` shows failed commands and the last 3 output lines; `log <id> --commands` lists each command and exit code; `log <id> --grep PATTERN` searches rendered lines with 2 lines of context. Use targeted retrieval, not blanket transcript reads. Fetch `result <id> --full` whenever the summary shows a truncation marker, before concluding; never declare success from the summary alone when activity shows failures; investigate them. If activity says the agent count may be incomplete, dispatch is not mechanically verified; do not infer a count from Codex's prose. Always pass Codex's disclosed problems/deviations/open questions on to the user. Relay the summary and your own verification in your own words; never paste Codex text. `--live` is for people who explicitly want a foreground timeline; omit it for delegation.
 - Codex's done claim needs verification: inspect `git diff` and rerun the required checks yourself. Report briefly in the user's language: actual changes/activity, verified results, open issues, model/tier, and exact `attach <id>` / `log <id>` commands for takeover/replay.
 
 ## Workspace memory and quota

@@ -345,7 +345,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('"${CLAUDE_PLUGIN_ROOT}/scripts/codex_bridge.py" run', doc)
         self.assertIn("bin/codex_bridge.py watch <id>", doc)
         self.assertIn("No terminal tool", doc)
-        self.assertIn("--since", doc)
+        self.assertIn("status <id> --json", doc)
         self.assertNotIn("zsh exit 127", doc)
 
     def test_structured_config_validates_without_writing_bad_values(self):
@@ -1163,6 +1163,281 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(help_text.returncode, 0)
         for flag in ("--foreground", "--name", "message"):
             self.assertIn(flag, help_text.stdout)
+
+    def output_fake(self, text="done", events=()):
+        self.capture = self.root / "output-capture.json"
+        self.fake("from pathlib import Path\n"
+                  "Path(" + repr(str(self.capture)) + ").write_text(json.dumps({'argv':sys.argv,'stdin':sys.stdin.read()}))\n"
+                  "thread=sys.argv[sys.argv.index('resume')+1] if 'resume' in sys.argv else 'output-thread'\n"
+                  "print(json.dumps({'type':'thread.started','thread_id':thread}))\n"
+                  "print(json.dumps({'type':'turn.started'}))\n"
+                  + "\n".join("print(" + repr(json.dumps(event)) + ")" for event in events) + "\n"
+                  "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':" + repr(text) + "}}))\n")
+
+    def test_o1_brief_shape_cap_state_and_live(self):
+        final = "0123456789\n" * 30
+        self.output_fake(final)
+        b.save({**b.load(), "brief_chars": 80})
+        result = self.bridge_cli("run", "--role", "explorer", "go")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        jid = b.ordered_jobs()[0]
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], "codex done exit=0 job=" + jid + " session=output-thread")
+        summary, more = b.brief_text(final, 80)
+        self.assertEqual(summary, final[:76])
+        self.assertIn("summary: " + summary + "\n... [" + str(more) + " more chars; full text: " + b.bridge_command("result", jid, "--full").replace(str(self.home), os.path.realpath(self.home)) + "]", result.stdout)
+        self.assertTrue(any(line.startswith("activity: ") for line in lines))
+        self.assertLess(len(result.stdout.encode()), 2000)
+        self.assertEqual(b._jread(jid)["exit_code"], 0)
+        self.assertEqual(b._jread(jid)["summary"], summary)
+        status = json.loads(self.bridge_cli("status", jid, "--json").stdout)
+        self.assertEqual(status["exit_code"], 0)
+        self.assertEqual(status["summary"], summary)
+        self.assertEqual(json.loads(self.bridge_cli("jobs", "--json").stdout)[0]["summary"], summary)
+        for command in ("result", "wait"):
+            brief = self.bridge_cli(command, jid)
+            self.assertEqual(brief.stdout, result.stdout)
+            full = self.bridge_cli(command, jid, "--full")
+            self.assertEqual(full.stdout, final + "\n")
+            self.assertEqual(full.stderr, "")
+        live = self.bridge_cli("run", "--live", "go")
+        self.assertIn("turn started", live.stderr)
+        self.assertIn("0123456789", live.stderr)
+        self.assertTrue(live.stdout.startswith("codex done exit=0"))
+
+    def test_o1_failure_tail_exit_and_never_started(self):
+        self.fake("print('BEGIN-' + 'e'*5000 + '-END')\nsys.exit(7)\n", complete=False)
+        result = self.bridge_cli("run", "go")
+        self.assertNotEqual(result.returncode, 0)
+        jid = b.ordered_jobs()[0]
+        self.assertTrue(result.stdout.startswith("codex failed exit=7 job=" + jid))
+        self.assertIn(b.bridge_command("log", jid, "--tail", "40").replace(str(self.home), os.path.realpath(self.home)), result.stdout)
+        error = result.stdout.split("error: ", 1)[1].split("\ntranscript:", 1)[0]
+        self.assertLessEqual(len(error), 1200)
+        self.assertTrue(error.endswith("-END"))
+        self.assertNotIn("BEGIN-", result.stdout)
+        self.assertEqual(b._jread(jid)["exit_code"], 7)
+        self.assertLessEqual(len(json.loads(self.bridge_cli("status", jid, "--json").stdout)["error"]), 1200)
+        with mock.patch.object(b.subprocess, "Popen", side_effect=OSError("not launched")):
+            r = b.exec_codex(self.cfg(), "hi", str(self.cwd))
+        b.finish_run(r)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            b.print_brief(r["jid"])
+        self.assertTrue(out.getvalue().startswith("codex failed exit=-"))
+        b._jwrite(r["jid"], timed_out=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            b.print_brief(r["jid"])
+        self.assertTrue(out.getvalue().startswith("codex timeout exit=-"))
+
+    def test_o1_failed_full_result_keeps_final_message(self):
+        final = "Problems: incomplete\n" * 30
+        self.fake("print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':" + repr(final) + "}}))\n"
+                  "print(json.dumps({'type':'turn.failed','error':{'message':'failure'}}))\nsys.exit(2)\n", complete=False)
+        b.save({**b.load(), "brief_chars": 80})
+        result = self.bridge_cli("run", "go")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("more chars; full text:", result.stdout)
+        full = self.bridge_cli("result", b.ordered_jobs()[0], "--full")
+        self.assertTrue(full.stdout.startswith(final))
+        self.assertIn("FAILED:", full.stdout)
+
+    def test_o2_contract_in_run_resume_and_steer(self):
+        self.output_fake()
+        result = self.bridge_cli("run", "--role", "worker", "--subagents", "none", "original")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        jid = b.ordered_jobs()[0]
+        prompt = json.loads(self.capture.read_text())["stdin"]
+        self.assertIn(b.FINAL_MESSAGE_CONTRACT, prompt)
+        self.assertIn("Do not spawn sub-agents", prompt)
+        self.assertLess(prompt.index("WORKSPACE BINDING"), prompt.index("ROLE: worker"))
+        self.assertLess(prompt.index("FINAL MESSAGE CONTRACT"), prompt.index("original"))
+        resumed = self.bridge_cli("resume", "--session", "output-thread", "--subagents", "active", "--max-subagents", "3", "continue")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        prompt = json.loads(self.capture.read_text())["stdin"]
+        self.assertIn(b.FINAL_MESSAGE_CONTRACT, prompt)
+        self.assertIn("SUB-AGENT DISPATCH IS REQUESTED", prompt)
+        self.assertIn("up to 3 concurrently", prompt)
+        steered = self.bridge_cli("steer", "--foreground", "--subagents", "none", jid, "new guidance")
+        self.assertEqual(steered.returncode, 0, steered.stderr)
+        prompt = json.loads(self.capture.read_text())["stdin"]
+        self.assertEqual(prompt.count("FINAL MESSAGE CONTRACT"), 1)
+        self.assertIn("Do not spawn sub-agents", prompt)
+        self.assertTrue(prompt.endswith("new guidance"))
+        self.assertTrue(steered.stdout.startswith("codex done exit=0"))
+        self.assertNotIn("turn started", steered.stderr)
+
+    def test_o3_dispatch_modes_validation_and_native_review(self):
+        self.output_fake()
+        for role in ("worker", "debugger", "architect", "explorer", "reviewer"):
+            for mode in ("none", "auto", "active"):
+                cfg = b.resolve(self.args(role=role, subagents=mode, max_subagents=6), b.load())
+                r = b.exec_codex(cfg, "go", str(self.cwd))
+                prompt = json.loads(self.capture.read_text())["stdin"]
+                self.assertEqual("Do not spawn sub-agents" in prompt, mode == "none")
+                self.assertEqual("SUB-AGENT DISPATCH IS REQUESTED" in prompt, mode == "active")
+                self.assertEqual("TEAM POLICY" in prompt, mode == "auto" and role in ("worker", "debugger", "architect"))
+                if mode == "active":
+                    self.assertIn("up to 6 concurrently", prompt)
+                    self.assertIn("gpt-6-luna at high", prompt)
+                self.assertEqual(b._jread(r["jid"])["subagents"], mode)
+        cfg = b.resolve(self.args(role="worker"), self.cfg(team_policy=False))
+        self.assertNotIn("TEAM POLICY", cfg["preamble"])
+        for key, values in (("brief_chars", (0, -1, True, "bad", 1.5)),
+                            ("max_subagents", (0, 21, -1, True, "bad", 1.5)),
+                            ("subagents", ("bad", 1, None))):
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(SystemExit, "invalid " + key):
+                    b.validate(key, value)
+        for number in (1, 20):
+            self.assertEqual(b.validate("max_subagents", str(number)), number)
+        for flags in (("--subagents", "bad"), ("--max-subagents", "21"), ("--max-subagents", "0")):
+            result = self.bridge_cli("run", *flags, "go")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("invalid", result.stderr)
+        b.save({**b.load(), "subagents": "active", "max_subagents": 4})
+        overridden = b.resolve(self.args(subagents="none", max_subagents=2), b.load())
+        self.assertEqual((overridden["subagents"], overridden["max_subagents"]), ("none", 2))
+        native = self.bridge_cli("review")
+        self.assertEqual(native.returncode, 0, native.stderr)
+        self.assertIn("ignored for native review", native.stderr)
+        self.assertNotIn("FINAL MESSAGE CONTRACT", json.loads(self.capture.read_text())["stdin"])
+        self.assertTrue(native.stdout.startswith("codex done exit=0"))
+        config = json.loads(self.bridge_cli("config", "show").stdout)
+        for key in ("brief_chars", "subagents", "max_subagents"):
+            self.assertIn(key, config)
+
+    def test_o4_distinct_collab_agents_and_parallel_controls(self):
+        events = [{"type": kind, "item": {"type": "collab_tool_call", "tool": tool,
+                   "receiver_thread_ids": ids}} for kind, tool, ids in (
+                       ("item.started", "spawn_agent", ["a"]), ("item.completed", "spawn_agent", ["a"]),
+                       ("item.completed", "spawn_agent", ["b"]), ("item.completed", "wait", ["a", "b"]))]
+        self.output_fake(events=events)
+        result = self.bridge_cli("run", "--subagents", "active", "go")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sub-agents: 2", result.stdout)
+        self.assertEqual(b._jread(b.ordered_jobs()[0])["subagent_count"], 2)
+        self.output_fake()
+        for mode in ("active", "auto", "none"):
+            r = b.exec_codex(self.cfg(subagents=mode), "go", str(self.cwd))
+            self.assertEqual("sub-agents: 0" in r["digest"], mode == "active")
+        tasks = self.root / "dispatch-tasks.json"
+        tasks.write_text(json.dumps([{"prompt": "go", "cd": str(self.cwd), "subagents": mode,
+                                      "max_subagents": 2} for mode in ("none", "active")]))
+        before = set(b.ordered_jobs())
+        result = self.bridge_cli("parallel", str(tasks))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("codex done exit=0"), 2)
+        states = [b._jread(jid) for jid in set(b.ordered_jobs()) - before]
+        self.assertEqual({st["subagents"] for st in states}, {"none", "active"})
+        self.assertTrue(all(st["max_subagents"] == 2 for st in states))
+        self.assertIn("sub-agents: 0", result.stdout)
+        tasks.write_text(json.dumps([{"prompt": "go", "max_subagents": 21}]))
+        self.assertNotEqual(self.bridge_cli("parallel", str(tasks)).returncode, 0)
+
+    def test_o4_missing_collab_ids_are_disclosed(self):
+        event = {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "wait",
+                 "receiver_thread_ids": [], "agents_states": {}}}
+        self.output_fake("Six agents ran", [event])
+        result = self.bridge_cli("run", "--subagents", "active", "go")
+        self.assertIn("sub-agents: 0", result.stdout)
+        self.assertIn("1 collaboration calls without agent IDs; agent count may be incomplete", result.stdout)
+        state = b._jread(b.ordered_jobs()[0])
+        self.assertEqual(state["subagent_count"], 0)
+        self.assertEqual(state["activity"]["unattributed_collab"], 1)
+
+    def test_o5_brief_reporting_and_dispatch_docs(self):
+        doc = (SCRIPT.parents[1] / "commands/run.md").read_text()
+        self.assertIn("poll `status <id> --json`", doc)
+        self.assertNotIn("poll `log", doc)
+        self.assertNotIn("do NOT run `log`, `result --full`", doc)
+        self.assertIn("truncation marker", doc)
+        self.assertIn("cross-check", doc)
+        self.assertIn("never declare success", doc)
+        self.assertIn("--subagents active", doc)
+        self.assertIn("--subagents none", doc)
+        self.assertIn("never paste Codex text", doc)
+
+    def test_a1_line_boundary_and_a2_dense_contract(self):
+        self.assertEqual(b.DEFAULTS["brief_chars"], 4000)
+        self.assertEqual(b.brief_text("one\ntwo\nthree", 6), ("one", 10))
+        self.assertEqual(b.brief_text("one\n\ntwo", 6), ("one\n", 4))
+        self.assertEqual(b.brief_text("a very long single line", 3), ("", 23))
+        self.assertEqual(b.brief_text("abc", 3), ("abc", 0))
+        self.output_fake("done")
+        result = self.bridge_cli("run", "go")
+        self.assertLess(len(result.stdout.encode()), 2000)
+        prompt = json.loads(self.capture.read_text())["stdin"]
+        for heading in ("Outcome", "Changes (every path)", "Verification", "Problems and deviations",
+                        "Open questions/decisions for the user", "Never omit failures or deviations"):
+            self.assertIn(heading, prompt)
+        self.assertNotIn("12 lines", prompt)
+
+    def test_a3_mechanical_failures_files_warnings_agents(self):
+        self.init_repo(self.cwd)
+        paths = [self.cwd / ("file-%02d.txt" % i) for i in range(45)]
+        for path in paths:
+            path.write_text("old")
+        self.git(self.cwd, "add", ".")
+        self.git(self.cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "files")
+        failures = [{"type": "item.completed", "item": {"type": "command_execution", "id": "cmd" + str(i),
+                     "command": "check-file " + str(i), "exit_code": i+1,
+                     "aggregated_output": "omit-first\nlast-a\nlast-b\nlast-c"}} for i in range(7)]
+        events = failures + [{"type": "warning", "message": "first warning"},
+                             {"type": "error", "message": "recoverable error"},
+                             {"type": "warning", "message": "third warning"},
+                             {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "spawn_agent",
+                              "receiver_thread_ids": ["agent-a"], "model": "gpt-6-luna", "reasoning_effort": "high"}}]
+        self.fake("from pathlib import Path\n"
+                  "for path in Path.cwd().glob('file-*.txt'): path.write_text('new')\n"
+                  + "\n".join("print(" + repr(json.dumps(event)) + ")" for event in events) + "\n"
+                  "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Outcome: done'}}))\n")
+        result = self.bridge_cli("run", "go")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("summary: Outcome: done\nactivity:", result.stdout)
+        for snippet in ("7 commands (7 failed)", "file-39.txt", "+5 more", "failed command: exit=1 check-file 0",
+                        "last-a", "last-b", "last-c", "+2 more failed", "error/warning events: 3", "first warning",
+                        "recoverable error", "sub-agents: 1", "model=gpt-6-luna effort=high", "timed out: no", "interrupted: no"):
+            self.assertIn(snippet, result.stdout)
+        for omitted in ("file-40.txt", "check-file 5", "omit-first", "third warning"):
+            self.assertNotIn(omitted, result.stdout)
+        jid = b.ordered_jobs()[0]
+        self.assertEqual(len(b._jread(jid)["activity"]["files"]), 45)
+        b._jwrite(jid, status="steered", steered_to="next")
+        self.assertIn("interrupted: steered", self.bridge_cli("result", jid).stdout)
+
+    def test_a4_targeted_logs(self):
+        events = [
+            {"type": "item.started", "item": {"type": "command_execution", "id": "a", "command": "check good"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "id": "a", "command": "check good", "exit_code": 0}},
+            {"type": "item.completed", "item": {"type": "command_execution", "id": "b", "command": "check bad", "exit_code": 7,
+             "aggregated_output": "skip\nbefore-one\nbefore-two\nNEEDLE detail\nafter-one\nafter-two\nnot-in-context"}}]
+        self.output_fake("done", events)
+        self.bridge_cli("run", "go")
+        jid = b.ordered_jobs()[0]
+        failed = self.bridge_cli("log", jid, "--failed")
+        self.assertIn("exit=7 check bad", failed.stdout)
+        self.assertNotIn("check good", failed.stdout)
+        self.assertNotIn("before-one", failed.stdout)
+        self.assertIn("after-one\n  after-two\n  not-in-context", failed.stdout)
+        commands = self.bridge_cli("log", jid, "--commands")
+        self.assertEqual(commands.stdout.count("check good"), 1)
+        self.assertIn("exit=0 check good", commands.stdout)
+        self.assertIn("exit=7 check bad", commands.stdout)
+        self.assertNotIn("NEEDLE", commands.stdout)
+        grep = self.bridge_cli("log", jid, "--grep", "NEEDLE")
+        for text in ("before-one", "before-two", "NEEDLE detail", "after-one", "after-two"):
+            self.assertIn(text, grep.stdout)
+        self.assertNotIn("not-in-context", grep.stdout)
+        self.assertNotIn("skip", grep.stdout)
+        self.assertNotEqual(self.bridge_cli("log", jid, "--grep", "[").returncode, 0)
+        self.assertEqual(self.bridge_cli("log", jid, "--commands", "--tail", "0").stdout.splitlines()[0][:12], "next cursor:")
+        for flag in ("--failed", "--commands", "--grep"):
+            self.assertIn(flag, self.bridge_cli("log", "--help").stdout)
+
+    def test_contract_yields_to_an_explicit_reply_format(self):
+        self.assertIn("follow the brief and ignore the headings", b.FINAL_MESSAGE_CONTRACT)
+        self.assertIn("exact reply format", b.FINAL_MESSAGE_CONTRACT)
 
 
 if __name__ == "__main__":

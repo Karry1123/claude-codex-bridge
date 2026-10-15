@@ -15,6 +15,10 @@ Subcommands:
   models                       list models/efforts from Codex's local cache
   status                       codex version + effective defaults
 
+Output: brief by default; --live opts into foreground stderr timelines.
+result/wait --full prints the complete saved result.
+run/resume/steer --subagents none|auto|active --max-subagents 1..20 controls prompt-level dispatch.
+
 Persistent settings: ~/.claude/codex-bridge/settings.json
 Per-call flags override them: --model --effort --sandbox --cd --add-dir --timeout --profile
 """
@@ -40,6 +44,9 @@ DEFAULTS = {
     "review_effort": "high",
     "team_policy": True,               # tell Codex how/when to spawn sub-agents and with which models
     "max_parallel": 4,
+    "brief_chars": 4000,
+    "subagents": "auto",
+    "max_subagents": 20,
     "codex_memory": "scoped",  # scoped = bind Codex's global memory to this workspace; off = no memory read/write; on = native
     "roles": {},  # user overrides/additions, merged over ROLES below
 }
@@ -123,16 +130,21 @@ def validate(k, v):
     elif k == "sandbox":
         if not isinstance(v, str) or v not in SANDBOXES:
             fail(f"must be one of {sorted(SANDBOXES)}")
-    elif k in ("timeout", "max_parallel"):
+    elif k in ("timeout", "max_parallel", "brief_chars", "max_subagents"):
         try:
             if isinstance(v, bool) or not isinstance(v, (int, str)):
                 raise ValueError()
             value = int(v)
             if value < 1:
                 raise ValueError()
+            if k == "max_subagents" and value > 20:
+                fail("must be an integer from 1 to 20")
             return value
         except (ValueError, TypeError):
-            fail("must be a positive integer")
+            fail("must be an integer from 1 to 20" if k == "max_subagents" else "must be a positive integer")
+    elif k == "subagents":
+        if not isinstance(v, str) or v not in ("none", "auto", "active"):
+            fail("must be one of none, auto, active")
     elif k == "codex_memory":
         if not isinstance(v, str) or v not in ("scoped", "off", "on"):
             fail("must be one of ['off', 'on', 'scoped']")
@@ -338,10 +350,10 @@ def team_policy(s):
         "\n\nTEAM POLICY (you are the lead; sub-agents are OPTIONAL, use them only when work splits into independent "
         "parts with DISJOINT files/inputs; never for small tasks). Pick the model per sub-agent when you spawn it:\n"
         f"- Highly repetitive, simple per-item work (bulk edits, per-file/per-record transforms, format conversion, "
-        f"extraction, mechanical checks): fan out `{s['model_bulk']}` sub-agents, up to 20 running concurrently "
+        f"extraction, mechanical checks): fan out `{s['model_bulk']}` sub-agents, up to {s['max_subagents']} running concurrently "
         f"(it handles high concurrency well), reasoning effort high (xhigh only if items are subtle). Use it when "
         f"there are roughly 10+ independent items: one sub-agent per item or per small shard, disjoint outputs; for "
-        f"large batches use many shards (up to the 20 concurrent) to cut latency; for fewer items just do the work yourself. Spot-check a sample of their outputs before reporting.\n"
+        f"large batches use many shards (up to the {s['max_subagents']} concurrent) to cut latency; for fewer items just do the work yourself. Spot-check a sample of their outputs before reporting.\n"
         f"- Work that needs real intelligence (design, tricky logic, hard debugging, judging quality or ambiguity): "
         f"`{s['model_reasoning']}`, effort medium (high if genuinely hard).\n"
         f"- Everything else: do it yourself, or `{s['model']}` at medium.\n"
@@ -362,14 +374,16 @@ def resolve(a, s):
     sdef = {"reviewer": {"model": s["review_model"], "effort": s["review_effort"]},
             "architect": {"model": s["model_reasoning"]}}.get(rname, {})
     g = lambda k: next(v for v in (getattr(a, k, None), role.get(k), sdef.get(k), s[k]) if v is not None)
-    cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile")}
+    cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile", "subagents", "max_subagents", "brief_chars")}
     if rname in ("explorer", "reviewer", "architect"):
         cfg["sandbox"] = getattr(a, "sandbox", None) or "read-only"
     validate("effort", cfg["effort"]); validate("sandbox", cfg["sandbox"])
     cfg["timeout"] = validate("timeout", cfg["timeout"])
+    for key in ("subagents", "max_subagents", "brief_chars"):
+        cfg[key] = validate(key, cfg[key])
     cfg["preamble"] = role.get("preamble", "")
-    if s.get("team_policy") and rname in ("worker", "debugger", "architect"):
-        cfg["preamble"] += team_policy(s)
+    if cfg["subagents"] == "auto" and s.get("team_policy") and rname in ("worker", "debugger", "architect"):
+        cfg["preamble"] += team_policy({**s, "max_subagents": cfg["max_subagents"]})
     return cfg
 
 
@@ -631,17 +645,136 @@ def memory_flags(mode, native_review=False):
     return flags
 
 
+FINAL_MESSAGE_CONTRACT = (
+    "FINAL MESSAGE CONTRACT: Your final message is read by another agent. If the brief specifies an exact reply format "
+    "or exact reply text, follow the brief and ignore the headings below. Otherwise report as long as needed but dense "
+    "(soft target 40 lines or fewer), under these fixed headings: Outcome; Changes (every path); "
+    "Verification (each check with the command and its real exit code/result); Problems and deviations "
+    "(anything that failed, was skipped, was assumed, or differs from the brief); Open questions/decisions for the user. "
+    "Never omit failures or deviations to save space. No logs, no file contents, no restating the task."
+)
+
+
+def brief_text(text, limit):
+    if len(text) <= limit:
+        return text, 0
+    boundary = text.rfind("\n", 0, limit + 1)
+    summary = text[:boundary].rstrip("\r") if boundary >= 0 else ""
+    return summary, len(text) - len(summary)
+
+
+def event_notice(event):
+    item = event.get("item") or {}
+    if event.get("type") in ("error", "warning", "turn.failed"):
+        message = event.get("error") or event.get("message") or event.get("text") or event
+    elif isinstance(item, dict) and item.get("type") in ("error", "warning"):
+        message = item.get("message") or item.get("text") or item
+    elif event.get("type") == "raw" and re.search(r"\b(?:WARN(?:ING)?|ERROR)\b", event.get("text", "")):
+        message = event["text"]
+    else:
+        return None
+    return message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+
+
+def command_record(item):
+    return {"command": item.get("command", ""), "exit_code": item.get("exit_code"),
+            "tail": str(item.get("aggregated_output") or "").splitlines()[-3:]}
+
+
+def command_line(command):
+    text = str(command.get("command", "")).replace("\r", "\\r").replace("\n", "\\n")
+    code = command.get("exit_code")
+    return f"exit={code if code is not None else '?'} {text}"
+
+
+def activity_digest(facts, state=None):
+    state = state or {}
+    parts = [f"{facts['commands']} commands ({facts['failed_count']} failed)"]
+    files = facts.get("files")
+    parts.append("files touched: " + ("unavailable" if files is None else
+                 (", ".join(files[:40]) or "none") + (f" +{len(files)-40} more" if len(files) > 40 else "")))
+    if facts.get("hash_capped"):
+        parts.append(f"hash snapshot capped ({HASH_FILE_LIMIT} files / {HASH_BYTE_LIMIT} bytes); touched list incomplete")
+    parts.append(f"error/warning events: {facts['notice_count']}")
+    interrupted = state.get("status") if state.get("status") in ("cancelled", "steered") else None
+    if state.get("status") in ("cancelling", "cleanup_pending"):
+        interrupted = state.get("cleanup_target", "interrupted")
+    parts.append("timed out: " + ("yes" if facts.get("timed_out") else "no"))
+    parts.append("interrupted: " + (interrupted or facts.get("interrupted") or "no"))
+    agents = facts.get("agents", {})
+    if agents or facts.get("subagents") == "active":
+        parts.append(f"sub-agents: {len(agents)}")
+        visible = [f"{tid} model={meta.get('model') or '?'} effort={meta.get('effort') or '?'}"
+                   for tid, meta in agents.items() if meta.get("model") or meta.get("effort")]
+        if visible:
+            parts.append("agents: " + "; ".join(visible))
+    if facts.get("unattributed_collab"):
+        parts.append(f"{facts['unattributed_collab']} collaboration calls without agent IDs; agent count may be incomplete")
+    usage = facts.get("usage") or {}
+    parts.append(f"tokens in/out {usage.get('input_tokens', '?')}/{usage.get('output_tokens', '?')}")
+    parts.append("quota: " + (facts.get("quota") or "unavailable"))
+    lines = [" · ".join(parts)]
+    for failure in facts.get("failures", []):
+        lines.append("  failed command: " + command_line(failure))
+        lines.extend("    " + line for line in failure["tail"])
+    if facts["failed_count"] > len(facts.get("failures", [])):
+        lines.append(f"  +{facts['failed_count'] - len(facts['failures'])} more failed")
+    lines.extend("  error/warning: " + message for message in facts.get("notices", []))
+    return "\n".join(lines)
+
+
+def dispatch_prompt(cfg, settings):
+    mode = cfg.get("subagents", settings["subagents"])
+    if mode == "none":
+        return "Do not spawn sub-agents; do all the work yourself."
+    if mode == "active":
+        return (
+            "SUB-AGENT DISPATCH IS REQUESTED for this task: before working, split it into independent parts with disjoint "
+            f"files/inputs, spawn sub-agents in parallel (up to {cfg.get('max_subagents', settings['max_subagents'])} concurrently), "
+            f"choose the model per the team policy (bulk repetitive work: {settings['model_bulk']} at high; "
+            f"real reasoning: {settings['model_reasoning']} at medium; otherwise the lead model {cfg['model']} at medium), "
+            "give each a self-contained brief and a disjoint output location, stay responsible for integrating and "
+            "spot-checking their output, and say in your final message how many sub-agents ran, with which model/effort, "
+            "and what each produced. If the task cannot be split into independent parts, say so and do it yourself."
+        )
+    return ""  # Optional auto policy is already in eligible roles' preambles.
+
+
+def collab_receivers(event):
+    item = event.get("item") or {}
+    if not isinstance(item, dict) or item.get("type") != "collab_tool_call":
+        return set()
+    ids = item.get("receiver_thread_ids") or []
+    if not isinstance(ids, list):
+        ids = []
+    ids = ids + [item.get("receiver_thread_id")]
+    states = item.get("agents_states")
+    if isinstance(states, dict):
+        ids += list(states)
+    return {value for value in ids if isinstance(value, str) and value}
+
+
 def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, review=None,
                jid=None, live=False, kind="task", name=None):
     """Run codex once, streaming events to <run>/events.jsonl. Returns dict(ok, text, thread, error,
     usage, cfg, jid, digest). live=True also prints a readable timeline to stderr as it happens."""
     s = load()
+    cfg = dict(cfg)
+    for key in ("subagents", "max_subagents", "brief_chars"):
+        cfg[key] = validate(key, cfg.get(key, s[key]))
     validate_model(cfg, cd)
     if resume and cfg["sandbox"] not in SANDBOXES:
         cfg = {**cfg, "sandbox": s["sandbox"]}
     cdir = os.path.realpath(cd or os.getcwd())
     if jid is None:
         jid = new_run(kind, cfg, prompt, cdir, review, name=name)
+    if review is None and prompt is not None:
+        prompt = FINAL_MESSAGE_CONTRACT + "\n\n" + prompt
+        dispatch = dispatch_prompt(cfg, s)
+        if dispatch:
+            prompt = dispatch + "\n\n" + prompt
+    elif review is not None and cfg["subagents"] != "auto":
+        print(f"[codex] WARNING: subagents={cfg['subagents']} ignored for native review (no prompt)", file=sys.stderr)
     if cfg["preamble"] and prompt:
         prompt = cfg["preamble"] + "\n\n" + prompt
     memory = cfg.get("session_memory", s.get("codex_memory", "scoped"))
@@ -678,6 +811,9 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     p = None
     timed_out, cleanup_errors = [], []
     msgs, errors, cmds, failed = [], [], 0, 0
+    subagent_ids, subagent_meta = set(), {}
+    failures, notices, notice_count = [], [], 0
+    unattributed_collab = 0
     raw_tail = deque(maxlen=20)
     final = ""
     execution_failed = False
@@ -705,6 +841,24 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     ev = {"type": "raw", "text": line.rstrip("\r\n")}
                     raw_tail.append(ev["text"][-1000:])
                 evf.write(json.dumps(ev, ensure_ascii=False) + "\n")
+                receivers = collab_receivers(ev)
+                subagent_ids.update(receivers)
+                item = ev.get("item") or {}
+                if ev.get("type") == "item.completed" and item.get("type") == "collab_tool_call" and not receivers:
+                    unattributed_collab += 1
+                for tid in receivers:
+                    meta = subagent_meta.setdefault(tid, {})
+                    visible = (item.get("agents_states") or {}).get(tid, {}) if isinstance(item.get("agents_states"), dict) else {}
+                    for key, value in (("model", item.get("model") or (visible.get("model") if isinstance(visible, dict) else None)),
+                                       ("effort", item.get("effort") or item.get("reasoning_effort") or
+                                        (visible.get("effort") or visible.get("reasoning_effort") if isinstance(visible, dict) else None))):
+                        if isinstance(value, str):
+                            meta[key] = value
+                notice = event_notice(ev)
+                if notice is not None:
+                    notice_count += 1
+                    if len(notices) < 2:
+                        notices.append(notice)
                 t = ev.get("type")
                 if t == "thread.started":
                     res["thread"] = ev.get("thread_id")
@@ -718,6 +872,8 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     elif it.get("type") == "command_execution":
                         cmds += 1
                         failed += it.get("exit_code") not in (0, None)
+                        if it.get("exit_code") not in (0, None) and len(failures) < 5:
+                            failures.append(command_record(it))
                 elif t in ("error", "turn.failed"):
                     if t == "turn.failed":
                         execution_failed = True
@@ -725,7 +881,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                 elif t == "turn.completed":
                     turn_completed = True
                     res["usage"] = ev.get("usage")
-                if live:
+                if live or notice is not None:
                     for ln in render_event(ev):
                         print(ln, file=sys.stderr, flush=True)
             p.wait(timeout=REAP_TIMEOUT)
@@ -750,6 +906,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                 if pipe:
                     pipe.close()
         Path(out).unlink(missing_ok=True)
+    res["exit_code"] = p.returncode if p else None
     res["text"] = final or (msgs[-1] if msgs else "")
     res["ok"] = bool(p and p.returncode == 0 and res["text"] and turn_completed and not timed_out and not execution_failed and not cleanup_errors)
     res["warnings"] = errors if not execution_failed else []
@@ -769,21 +926,24 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     changed = (sorted(name for name, digest in after["hashes"].items()
                       if before["hashes"].get(name) != digest)
                if before is not None and after is not None else None)
-    u = res["usage"] or {}
-    parts = [f"{cmds} commands" + (f" ({failed} failed)" if failed else "")]
-    if changed is not None:
-        parts.append("files touched: " + (", ".join(changed[:15]) + (" ..." if len(changed) > 15 else "") if changed else "none"))
-    if (before and before["capped"]) or (after and after["capped"]):
-        parts.append(f"hash snapshot capped ({HASH_FILE_LIMIT} files / {HASH_BYTE_LIMIT} bytes); touched list incomplete")
-    parts.append(f"tokens in/out {u.get('input_tokens', '?')}/{u.get('output_tokens', '?')}")
+    subagent_ids.discard(res["thread"])
+    res["subagent_count"] = len(subagent_ids)
     try:
         res["quota"] = read_quota(res["thread"])
     except Exception:
         res["quota"] = None  # Includes parallel tasks: telemetry never changes their results.
-    if res["quota"]:
-        parts.append("quota: " + res["quota"])
-    res["digest"] = " · ".join(parts)
-    _jwrite(jid, digest=res["digest"], thread=res["thread"], quota=res["quota"])
+    state = _jread(jid) or {}
+    facts = {"commands": cmds, "failed_count": failed, "failures": failures, "files": changed,
+             "hash_capped": bool((before and before["capped"]) or (after and after["capped"])),
+             "notice_count": notice_count, "notices": notices, "timed_out": bool(timed_out),
+             "interrupted": state.get("cleanup_target") if state.get("status") in ACTIVE else None,
+             "agents": {tid: subagent_meta.get(tid, {}) for tid in sorted(subagent_ids)},
+             "subagents": cfg["subagents"], "unattributed_collab": unattributed_collab,
+             "usage": res["usage"], "quota": res["quota"]}
+    res["digest"] = activity_digest(facts, state)
+    summary, more = brief_text(res["text"], cfg["brief_chars"])
+    _jwrite(jid, digest=res["digest"], activity=facts, thread=res["thread"], quota=res["quota"], exit_code=res["exit_code"],
+            summary=summary, summary_more_chars=more, subagent_count=res["subagent_count"])
     return res
 
 
@@ -802,7 +962,7 @@ def render_event(ev, full=False):
     if t == "turn.completed":
         u = ev.get("usage", {})
         return [f"── turn done · tokens in/out {u.get('input_tokens','?')}/{u.get('output_tokens','?')} ──"]
-    if t in ("error", "turn.failed"):
+    if t in ("error", "warning", "turn.failed"):
         return ["✘ " + _short(json.dumps(ev.get("error") or ev.get("message"), ensure_ascii=False), 300)]
     if t == "item.started" and ty == "collab_tool_call":
         return []
@@ -848,9 +1008,40 @@ def bridge_command(*args):
 
 
 def print_footer(r):
-    print(f"\n--- Codex activity: {r['digest']}\n    run {r['jid']} · session {r['thread']}"
-          f"\n    transcript: {bridge_command('log', r['jid'])}"
-          f"\n    take over : {bridge_command('attach', r['jid'])}")
+    print(f"transcript: {bridge_command('log', r['jid'])}")
+    print(f"take over: {bridge_command('attach', r['jid'])}")
+
+
+def print_brief(jid):
+    st = _jread(jid) or {}
+    status = st.get("status", "failed")
+    if status == "failed" and st.get("timed_out"):
+        status = "timeout"
+    code = st.get("exit_code")
+    print(f"codex {status} exit={code if code is not None else '-'} job={jid} session={st.get('thread') or '-'}")
+    summary = st.get("summary")
+    more = st.get("summary_more_chars", 0)
+    if summary is None:  # Older jobs still have their result file.
+        path = Path(_job_path(jid, "result.txt"))
+        text = path.read_text() if path.exists() else ""
+        limit = load()["brief_chars"]
+        summary, more = brief_text(text, limit)
+    print("summary: " + summary)
+    if more:
+        print(f"... [{more} more chars; full text: {bridge_command('result', jid, '--full')}]")
+    print("activity: " + (activity_digest(st["activity"], st) if st.get("activity") else st.get("digest", "")))
+    if status in ("failed", "timeout", "cleanup_pending"):
+        print("error: " + st.get("error", "")[-1200:])
+        print("transcript: " + bridge_command("log", jid, "--tail", "40"))
+        print("take over: " + bridge_command("attach", jid))
+    else:
+        print_footer({"jid": jid})
+
+
+def report_run(r):
+    print_brief(r["jid"])
+    if not r["ok"]:
+        sys.exit(1)
 
 
 def find_session(cwd=None, thread=None, name=None):
@@ -922,7 +1113,6 @@ def prepare_run(a, resume):
         prompt = sys.stdin.read()
     if not prompt.strip():
         sys.exit("empty prompt")
-    print(header(cfg, getattr(a, "role", None)) + (" (session inherited)" if resume else ""), file=sys.stderr)
     validate_model(cfg, cwd_)
     jid = new_run("resume" if resume else "task", cfg, prompt, cwd_, name=label)
     if session:
@@ -941,13 +1131,10 @@ def run_codex(a, resume):
             cfg, prompt, session, resume, label, jid = prepare_run(a, resume)
     if a.background:
         return start_job("resume" if resume else "task", cfg, prompt, a.cd, a.add_dir, resume, session, name=label, jid=jid)
-    r = exec_codex(cfg, prompt, a.cd, a.add_dir, session, resume, live=True,
+    r = exec_codex(cfg, prompt, a.cd, a.add_dir, session, resume, live=getattr(a, "live", False),
                    kind="resume" if resume else "task", name=label, jid=jid)
     finish_run(r)
-    if not r["ok"]:
-        sys.exit(f"CODEX FAILED: {r['error']}\n(run {r['jid']}; transcript: {bridge_command('log', r['jid'])})")
-    print(r["text"])
-    print_footer(r)
+    report_run(r)
 
 
 JOBS = os.path.join(BRIDGE_HOME, "jobs")
@@ -1266,6 +1453,8 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
             started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
             codex_memory=cfg.get("session_memory", load().get("codex_memory", "scoped")), native_review=review is not None,
+            exit_code=None, summary="", summary_more_chars=0,
+            subagents=cfg.get("subagents", load()["subagents"]), max_subagents=cfg.get("max_subagents", load()["max_subagents"]),
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
 
@@ -1273,6 +1462,10 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
 def finish_run(r):
     with job_state(r["jid"]) as st:
         st["worker_finished"] = True
+        limit = r.get("cfg", {}).get("brief_chars", load()["brief_chars"])
+        text = r.get("text", "")
+        summary, more = brief_text(text, limit)
+        st.update(exit_code=r.get("exit_code"), summary=summary, summary_more_chars=more)
         if st.get("status") in ("cancelled", "steered"):
             return
         if r.get("cleanup_pending"):
@@ -1285,7 +1478,8 @@ def finish_run(r):
             return
         if st.get("status") in ("cancelling", "cleanup_pending"):
             return
-        Path(_job_path(r["jid"], "result.txt")).write_text(r["text"] if r["ok"] else "FAILED: " + r["error"])
+        Path(_job_path(r["jid"], "result.txt")).write_text(
+            r["text"] if r["ok"] else (r["text"] + "\n\n" if r["text"] else "") + "FAILED: " + r["error"])
         st.update(status="done" if r["ok"] else "failed", usage=r["usage"],
                   error=r["error"], timed_out=r.get("timed_out", False), finished=time.time())
 
@@ -1406,7 +1600,13 @@ def _refresh(jid):
 
 
 def compact_state(st):
-    return {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error", "steered_to", "steered_from")}
+    state = {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error", "steered_to", "steered_from", "exit_code", "summary", "subagents", "subagent_count")}
+
+    if st.get("activity"):
+        state["digest"] = activity_digest(st["activity"], st)
+    if state.get("error"):
+        state["error"] = state["error"][-1200:]
+    return state
 
 
 def cmd_jobs(a):
@@ -1431,9 +1631,11 @@ def cmd_result(a):
     jid = _resolve_job(a.job, getattr(a, "name", None)); st = _refresh(jid)
     if st["status"] in ACTIVE:
         print(f"job {jid} still running"); return
-    print(Path(_job_path(jid, "result.txt")).read_text() if os.path.exists(_job_path(jid, "result.txt"))
-          else f"job {jid}: {st['status']} ({st.get('error','no output')})")
-    print(f"\n[job {jid} {st['status']} session={st.get('thread')}]", file=sys.stderr)
+    if getattr(a, "full", False):
+        path = Path(_job_path(jid, "result.txt"))
+        print(path.read_text() if path.exists() else st.get("error", ""))
+    else:
+        print_brief(jid)
 
 
 def cmd_wait(a):
@@ -1443,7 +1645,7 @@ def cmd_wait(a):
         if time.time() - t0 > a.timeout:
             print(f"job {jid} still running after {a.timeout}s"); return
         time.sleep(3)
-    cmd_result(argparse.Namespace(job=jid))
+    cmd_result(argparse.Namespace(job=jid, full=getattr(a, "full", False)))
 
 
 def legacy_process(jid, st):
@@ -1554,7 +1756,7 @@ def cmd_steer(a):
             if st.get("status") in ACTIVE and (st.get("thread") == old["thread"] or same_name):
                 sys.exit(f"session {old['thread']} already has active job {other}; nothing interrupted")
         settings = load()
-        cfg = resolve(argparse.Namespace(), settings)
+        cfg = resolve(a, settings)
         for key in ("model", "effort", "sandbox", "profile", "codex_memory"):
             cfg["session_memory" if key == "codex_memory" else key] = old.get(key, settings.get(key))
         if cfg["sandbox"] not in SANDBOXES:
@@ -1570,13 +1772,9 @@ def cmd_steer(a):
     if not a.foreground:
         return start_job("resume", cfg, prompt, old["cwd"], resume=True, session=old["thread"],
                          name=old.get("name"), jid=new)
-    r = exec_codex(cfg, prompt, old["cwd"], session=old["thread"], resume=True, jid=new, live=True)
+    r = exec_codex(cfg, prompt, old["cwd"], session=old["thread"], resume=True, jid=new, live=getattr(a, "live", False))
     finish_run(r)
-    if not r["ok"]:
-        sys.exit(f"CODEX FAILED: {r['error']}")
-    print(r["text"])
-    print_footer(r)
-
+    report_run(r)
 
 def _stream(jid, follow, full=False, since=0, tail=None):
     if since < 0 or (tail is not None and tail < 0):
@@ -1634,9 +1832,64 @@ def cmd_watch(a):
     _stream(_resolve_job(a.job, getattr(a, "name", None)), follow=True)
 
 
+def targeted_log(jid, a):
+    pattern = None
+    if getattr(a, "grep", None) is not None:
+        try:
+            pattern = re.compile(a.grep)
+        except re.error as exc:
+            sys.exit(f"invalid --grep pattern: {exc}")
+    since, tail = getattr(a, "since", 0), getattr(a, "tail", None)
+    if since < 0 or (tail is not None and tail < 0):
+        sys.exit("--since and --tail must be nonnegative")
+    events, cursor = [], 0
+    path = Path(_job_path(jid, "events.jsonl"))
+    if path.exists():
+        with path.open() as source:
+            for cursor, line in enumerate(source, 1):
+                if cursor <= since or not line.endswith("\n"):
+                    continue
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        events.append(event)
+                except ValueError:
+                    pass
+    if tail is not None:
+        events = events[-tail:] if tail else []
+    if pattern is not None:
+        lines = [line for event in events for rendered in render_event(event, full=True) for line in rendered.splitlines()]
+        selected = set()
+        for i, line in enumerate(lines):
+            if pattern.search(line):
+                selected.update(range(max(0, i - 2), min(len(lines), i + 3)))
+        previous = -1
+        for i in sorted(selected):
+            if previous >= 0 and i > previous + 1:
+                print("--")
+            print(lines[i])
+            previous = i
+    else:
+        commands = {}
+        for i, event in enumerate(events):
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "command_execution":
+                commands[item.get("id") or str(i)] = command_record(item)
+        for command in commands.values():
+            if getattr(a, "failed", False) and command["exit_code"] in (None, 0):
+                continue
+            print(command_line(command))
+            if getattr(a, "failed", False):
+                for line in command["tail"]:
+                    print("  " + line)
+    print(f"next cursor: {cursor}")
+
+
 def cmd_log(a):
-    _stream(_resolve_job(a.job, getattr(a, "name", None)), follow=False, full=a.full,
-            since=getattr(a, "since", 0), tail=getattr(a, "tail", None))
+    jid = _resolve_job(a.job, getattr(a, "name", None))
+    if getattr(a, "failed", False) or getattr(a, "commands", False) or getattr(a, "grep", None) is not None:
+        return targeted_log(jid, a)
+    _stream(jid, follow=False, full=a.full, since=getattr(a, "since", 0), tail=getattr(a, "tail", None))
 
 
 def cmd_attach(a):
@@ -1684,16 +1937,11 @@ def cmd_review(a):
         review = None
     else:
         prompt, review = None, tflags
-    print(header(cfg, "reviewer") + f" target={target}", file=sys.stderr)
     if a.background:
         return start_job("review", cfg, prompt, a.cd, review=review)
-    r = exec_codex(cfg, prompt, a.cd, review=review, live=True, kind="review")
+    r = exec_codex(cfg, prompt, a.cd, review=review, live=getattr(a, "live", False), kind="review")
     finish_run(r)
-    if not r["ok"]:
-        sys.exit(f"CODEX FAILED: {r['error']}")
-    print(r["text"])
-    print_footer(r)
-
+    report_run(r)
 
 def cmd_parallel(a):
     """Run many tasks concurrently. Input: JSON list (file or '-'):
@@ -1708,7 +1956,7 @@ def cmd_parallel(a):
         sys.exit("parallel expects a nonempty JSON task list")
     configs = []
     for task in tasks:
-        ns = argparse.Namespace(**{k: task.get(k) for k in ("role", "model", "effort", "sandbox", "profile", "timeout")})
+        ns = argparse.Namespace(**{k: task.get(k) for k in ("role", "model", "effort", "sandbox", "profile", "timeout", "subagents", "max_subagents")})
         cfg = resolve(ns, s)
         validate_model(cfg, task.get("cd"))
         configs.append(cfg)
@@ -1725,9 +1973,7 @@ def cmd_parallel(a):
         results = list(ex.map(one, enumerate(tasks)))
     failed = 0
     for name, role, r in results:
-        print(f"===== {name} {header(r['cfg'], role)} session={r['thread']} =====")
-        print(r["text"] if r["ok"] else f"FAILED: {r['error']}")
-        print(f"  [activity: {r['digest']} · run {r['jid']}]")
+        print_brief(r["jid"])
         failed += not r["ok"]
     sys.exit(1 if failed else 0)
 
@@ -1764,6 +2010,9 @@ def main():
         r.add_argument("--role", help="explorer|worker|debugger|reviewer|architect|custom")
         r.add_argument("--cd"); r.add_argument("--add-dir", action="append")
         r.add_argument("--timeout", type=int); r.add_argument("--profile")
+        r.add_argument("--live", action="store_true", help="print human timeline to stderr (default: brief output only)")
+        r.add_argument("--subagents", help="none|auto|active; prompt-level dispatch policy")
+        r.add_argument("--max-subagents", type=int, help="maximum concurrent sub-agents, 1..20")
         r.add_argument("--background", action="store_true", help="return a job id immediately")
         r.add_argument("--continue", dest="cont", action="store_true", help="continue the latest session in this directory (same context/model/effort)")
         r.add_argument("--name", help="named session: reuse the session labelled NAME here if it exists (inherits its model/effort), else start a new one and label it")
@@ -1776,7 +2025,7 @@ def main():
     status = sub.add_parser("status")
     status.add_argument("job", nargs="?", default="last"); status.add_argument("--name")
     status.add_argument("--json", action="store_true")
-    rv = sub.add_parser("review"); rv.add_argument("focus", nargs="*")
+    rv = sub.add_parser("review"); rv.add_argument("--live", action="store_true"); rv.add_argument("focus", nargs="*")
     g = rv.add_mutually_exclusive_group(); g.add_argument("--base"); g.add_argument("--commit")
     rv.add_argument("--adversarial", action="store_true"); rv.add_argument("--background", action="store_true")
     for x in ("model", "effort", "cd", "timeout", "profile"):
@@ -1786,14 +2035,22 @@ def main():
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
         if n == "log":
             q.add_argument("--full", action="store_true")
+            filters = q.add_mutually_exclusive_group()
+            filters.add_argument("--failed", action="store_true", help="failed commands with exit codes and last 3 output lines")
+            filters.add_argument("--commands", action="store_true", help="every command, one line each, with exit code")
+            filters.add_argument("--grep", metavar="PATTERN", help="regex over rendered lines, with 2 lines of context")
             q.add_argument("--since", type=int, default=0); q.add_argument("--tail", type=int)
         if n == "attach": q.add_argument("--force", action="store_true")
     for n in ("result", "cancel", "wait"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
+        if n in ("result", "wait"): q.add_argument("--full", action="store_true", help="print the full saved result instead of a capped summary")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
     steer = sub.add_parser("steer", help="interrupt safely and guide the same session (background by default)")
     steer.add_argument("job", nargs="?", default="last")
     steer.add_argument("--name", help="select a named session in this directory")
+    steer.add_argument("--live", action="store_true", help="print human timeline to stderr in foreground mode")
+    steer.add_argument("--subagents", help="none|auto|active; per-turn dispatch policy")
+    steer.add_argument("--max-subagents", type=int, help="maximum concurrent sub-agents, 1..20")
     steer.add_argument("--foreground", action="store_true")
     steer.add_argument("message", help="guidance text, or - to read stdin")
     sub.add_parser("_job").add_argument("jid")

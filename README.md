@@ -78,6 +78,16 @@ Every run is logged under `~/.claude/codex-bridge/jobs/`.
 
 Jobs longer than about 30 seconds go to the background on their own. For big or risky changes (many files, deletes, migrations), Claude first gets a read-only plan from Codex and asks you before going ahead. Say "just do it" to skip that.
 
+## What Claude gets back
+
+After a run Claude receives a compact report, not the log: a header with status, exit code, job and session; Codex's final message, capped at `brief_chars` and cut at a line boundary with the exact command for the full text; and an `activity` block of facts the bridge collects itself, so a sloppy summary cannot hide a problem: every touched file, each failed command with its exit code and last output lines, error and warning events, timeouts, sub-agent count, tokens and quota. Codex is asked to write its final message as Outcome, Changes, Verification, Problems and deviations, and Open questions, unless the brief specifies its own reply format.
+
+Nothing is dumped to stderr. Claude pulls detail only when needed: `result --full`, `log --failed`, `log --commands`, `log --grep PATTERN`. `--live` prints the timeline for people running the bridge by hand.
+
+## Sub-agents
+
+Claude decides per task whether Codex should dispatch sub-agents and passes `--subagents`: `active` when the work is large and splits into independent parts (roughly 10+ similar items, several independent modules, broad recon), `none` when it is small, serial, tightly coupled or edits shared files, `auto` otherwise (Codex splits only if it clearly pays off). `--max-subagents N` caps concurrency (up to 20).
+
 ## Memory and quota
 
 Codex keeps one global memory for all your projects and looks things up by keyword, so similar projects can leak into each other. The bridge binds each run to its workspace: it tells Codex which memory entries belong to the run's directory (the directory itself, or its git project root, so worktrees inherit their project) and to ignore all the others. A new workspace starts with empty memory that builds up from runs there. Set `codex_memory` to `off` to disable memory, or `on` for Codex's native behaviour.
@@ -102,6 +112,8 @@ Reviews run on `gpt-6-astra` high, read-only. The default target is your uncommi
 | `review_model`, `review_effort` | `gpt-6-astra`, `high` | reviews |
 | `team_policy` | `true` | tells the Codex lead when to spawn sub-agents and which model to give them |
 | `max_parallel` | `4` | concurrent jobs for `parallel` |
+| `brief_chars` | `4000` | cap for the summary Claude receives after a run (cut at a line boundary, with the command for the full text) |
+| `subagents`, `max_subagents` | `auto`, `20` | default sub-agent dispatch mode and concurrency cap |
 | `codex_memory` | `scoped` | `scoped` binds Codex's global memory to the run's workspace, `off` disables memory, `on` is Codex's native behaviour |
 | `timeout` | `1800` | seconds per run |
 | `profile` | empty | Codex config profile |
@@ -133,8 +145,9 @@ The plugin is a thin layer over `codex/scripts/codex_bridge.py`, which you can c
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
 resume --session ID "<message>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [focus ...]
+run ... [--subagents none|auto|active] [--max-subagents N] [--live]
 steer [id | --name L] "<message>"
-jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # optional job id or --name
+jobs | status | watch | log [--since N] [--tail N] [--full] [--failed] [--commands] [--grep P] | attach | wait | result | cancel   # optional job id or --name
 parallel tasks.json
 roles | models | usage | config [show | set k=v | reset]
 ```

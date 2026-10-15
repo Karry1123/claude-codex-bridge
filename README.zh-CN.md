@@ -78,6 +78,16 @@ Claude 在第一次调用前评估任务，并在整个 Codex 会话里保持这
 
 超过约 30 秒的任务会自动转后台。大改动或有风险的操作（很多文件、删除、数据迁移），Claude 会先让 Codex 以只读方式出方案，给你看并等你确认再动手。说一句"直接做"可以跳过。
 
+## Claude 拿到什么
+
+跑完后 Claude 收到的是一份紧凑的报告，不是日志：一行头（状态、退出码、任务号、会话号）；Codex 的最终回复，截到 `brief_chars` 并在行边界切断，附上取全文的确切命令；以及一个 `activity` 块，里面是桥接层自己收集的事实，所以 Codex 的总结写得再马虎也盖不住问题：每个改动的文件、每个失败命令的退出码和输出末几行、错误和警告事件、是否超时、子代理数量、token 和额度。除非任务单自己指定了回复格式，Codex 会按"结果、改动、验证、问题与偏差、待决事项"来写最终回复。
+
+不会往 stderr 倾倒日志。Claude 只在需要时取细节：`result --full`、`log --failed`、`log --commands`、`log --grep 关键词`。手动使用桥接脚本的人可以加 `--live` 打印时间线。
+
+## 子代理
+
+Claude 按任务判断 Codex 要不要派子代理，并通过 `--subagents` 告诉它：`active` 用于量大且能拆成独立部分的活（大约 10 个以上同类条目、多个独立模块、广泛调研）；`none` 用于小的、串行的、紧耦合的、或要改共享文件的任务；其余用 `auto`（Codex 只在明显划算时才拆）。`--max-subagents N` 限制并发（最多 20）。
+
 ## 记忆和额度
 
 Codex 只有一份覆盖所有项目的全局记忆，而且按关键词查找，所以名字、主题相近的项目会互相串。桥接层会把每次运行绑定到它的工作区：明确告诉 Codex 哪些记忆条目属于当前目录（目录本身，或它所在的 git 项目根，所以 worktree 会继承所属项目的记忆），其余一律忽略。全新的工作区一开始记忆是空的，会随着在这里的运行逐渐积累。把 `codex_memory` 设成 `off` 可以完全关闭记忆，设成 `on` 就是 Codex 原生行为。
@@ -102,6 +112,8 @@ Codex 只有一份覆盖所有项目的全局记忆，而且按关键词查找�
 | `review_model`、`review_effort` | `gpt-6-astra`、`high` | 审查 |
 | `team_policy` | `true` | 告诉 Codex 主控何时派子代理、每个用什么模型 |
 | `max_parallel` | `4` | `parallel` 的并发数 |
+| `brief_chars` | `4000` | 跑完后交给 Claude 的摘要长度上限（在行边界截断，并附上取全文的命令） |
+| `subagents`、`max_subagents` | `auto`、`20` | 子代理派发的默认模式和并发上限 |
 | `codex_memory` | `scoped` | `scoped` 把 Codex 的全局记忆绑定到本次运行的工作区，`off` 关闭记忆，`on` 是 Codex 原生行为 |
 | `timeout` | `1800` | 每次运行的秒数 |
 | `profile` | 空 | Codex 配置 profile |
@@ -133,8 +145,9 @@ Codex 默认以 `danger-full-access` 和审批策略 `never` 运行，也就是�
 run [--name L] [--role R] [--model M] [--effort E] [--sandbox S] [--cd DIR] [--background] [--continue] -
 resume --session ID "<消息>"
 review [--base REF | --commit SHA] [--adversarial] [--background] [关注点 ...]
+run ... [--subagents none|auto|active] [--max-subagents N] [--live]
 steer [id | --name L] "<消息>"
-jobs | status | watch | log [--since N] [--tail N] [--full] | attach | wait | result | cancel   # 可带任务号或 --name
+jobs | status | watch | log [--since N] [--tail N] [--full] [--failed] [--commands] [--grep P] | attach | wait | result | cancel   # 可带任务号或 --name
 parallel tasks.json
 roles | models | usage | config [show | set k=v | reset]
 ```
