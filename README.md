@@ -80,9 +80,9 @@ Jobs longer than about 30 seconds go to the background on their own. For big or 
 
 ## What Claude gets back
 
-After a run Claude receives a compact report, not the log: a header with status, exit code, job and session; Codex's final message, capped at `brief_chars` without losing what matters (problems, deviations and open questions are always kept whole; bulky sections such as Changes or Verification are trimmed or replaced by a stub that says how to fetch them; unstructured text keeps both its start and its end); and an `activity` block of facts the bridge collects itself, so a sloppy summary cannot hide a problem: every touched file, each failed command with its exit code and last output lines, error and warning events, timeouts, sub-agent count, tokens and quota. Codex is asked to write its final message as Outcome, Changes, Verification, Problems and deviations, and Open questions, unless the brief specifies its own reply format.
+After a run Claude receives Codex's final report exactly as Codex wrote it, never cut or reformatted, framed by a one-line header (status, exit code, job, session) and an `activity` block of facts the bridge collects itself, so a thin report cannot hide a problem: every touched file, each failed command with its exit code and last output lines, error and warning events, timeouts, sub-agent count, a one-line `steps:` summary, tokens and quota.
 
-Nothing is dumped to stderr. Claude pulls detail only when needed: `result --section NAME`, `result --full`, `log --failed`, `log --commands`, `log --grep PATTERN`. `--live` prints the timeline for people running the bridge by hand.
+The execution log in between is never dumped into the conversation. When Claude wants it, `log <id>` gives a compact trace: one line per step, runs of similar steps merged, scripts folded, output shown only for failures and test results, known harmless Codex noise folded into one line, unknown errors kept verbatim. A job whose raw log is 3 MB typically becomes a few KB. `log --full`, `--failed`, `--commands` and `--grep PATTERN` give more detail, and `watch` shows everything live. `--live` prints the timeline for people running the bridge by hand.
 
 ## Sub-agents
 
@@ -112,7 +112,6 @@ Reviews run on `gpt-6-astra` high, read-only. The default target is your uncommi
 | `review_model`, `review_effort` | `gpt-6-astra`, `high` | reviews |
 | `team_policy` | `true` | tells the Codex lead when to spawn sub-agents and which model to give them |
 | `max_parallel` | `4` | concurrent jobs for `parallel` |
-| `brief_chars` | `4000` | cap for the summary Claude receives after a run (cut at a line boundary, with the command for the full text) |
 | `subagents`, `max_subagents` | `auto`, `20` | default sub-agent dispatch mode and concurrency cap |
 | `codex_memory` | `scoped` | `scoped` binds Codex's global memory to the run's workspace, `off` disables memory, `on` is Codex's native behaviour |
 | `timeout` | `1800` | seconds per run |

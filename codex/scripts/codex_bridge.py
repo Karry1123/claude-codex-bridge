@@ -15,8 +15,9 @@ Subcommands:
   models                       list models/efforts from Codex's local cache
   status                       codex version + effective defaults
 
-Output: brief by default; --live opts into foreground stderr timelines.
-result/wait --full prints the complete saved result.
+Output: verbatim final report; --live opts into foreground stderr timelines.
+log defaults to a compact execution trace; log --full and watch show detail.
+result/wait --full prints only the saved report.
 run/resume/steer --subagents none|auto|active --max-subagents 1..20 controls prompt-level dispatch.
 
 Persistent settings: ~/.claude/codex-bridge/settings.json
@@ -44,7 +45,6 @@ DEFAULTS = {
     "review_effort": "high",
     "team_policy": True,               # tell Codex how/when to spawn sub-agents and with which models
     "max_parallel": 4,
-    "brief_chars": 4000,
     "subagents": "auto",
     "max_subagents": 20,
     "codex_memory": "scoped",  # scoped = bind Codex's global memory to this workspace; off = no memory read/write; on = native
@@ -102,6 +102,7 @@ def _load_settings():
     except (OSError, ValueError) as exc:
         sys.exit(f"cannot read settings {SETTINGS}: {exc}")
     try:
+        stored.pop("brief_chars", None)  # Removed setting in older bridge installations.
         stored = {k: validate(k, v) for k, v in stored.items()}
     except SystemExit as exc:
         sys.exit(f"cannot read settings {SETTINGS}: {exc}")
@@ -122,6 +123,8 @@ def validate(k, v):
     def fail(message):
         sys.exit(f"invalid {k}: {message}")
 
+    if k == "brief_chars":
+        fail("setting was removed; final reports are no longer truncated")
     if k not in DEFAULTS:
         fail(f"unknown key; keys: {', '.join(DEFAULTS)}")
     if k in ("effort", "review_effort"):
@@ -130,7 +133,7 @@ def validate(k, v):
     elif k == "sandbox":
         if not isinstance(v, str) or v not in SANDBOXES:
             fail(f"must be one of {sorted(SANDBOXES)}")
-    elif k in ("timeout", "max_parallel", "brief_chars", "max_subagents"):
+    elif k in ("timeout", "max_parallel", "max_subagents"):
         try:
             if isinstance(v, bool) or not isinstance(v, (int, str)):
                 raise ValueError()
@@ -374,12 +377,12 @@ def resolve(a, s):
     sdef = {"reviewer": {"model": s["review_model"], "effort": s["review_effort"]},
             "architect": {"model": s["model_reasoning"]}}.get(rname, {})
     g = lambda k: next(v for v in (getattr(a, k, None), role.get(k), sdef.get(k), s[k]) if v is not None)
-    cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile", "subagents", "max_subagents", "brief_chars")}
+    cfg = {k: g(k) for k in ("model", "effort", "sandbox", "timeout", "profile", "subagents", "max_subagents")}
     if rname in ("explorer", "reviewer", "architect"):
         cfg["sandbox"] = getattr(a, "sandbox", None) or "read-only"
     validate("effort", cfg["effort"]); validate("sandbox", cfg["sandbox"])
     cfg["timeout"] = validate("timeout", cfg["timeout"])
-    for key in ("subagents", "max_subagents", "brief_chars"):
+    for key in ("subagents", "max_subagents"):
         cfg[key] = validate(key, cfg[key])
     cfg["preamble"] = role.get("preamble", "")
     if cfg["subagents"] == "auto" and s.get("team_policy") and rname in ("worker", "debugger", "architect"):
@@ -645,115 +648,212 @@ def memory_flags(mode, native_review=False):
     return flags
 
 
-FINAL_MESSAGE_CONTRACT = (
-    "FINAL MESSAGE CONTRACT: Your final message is read by another agent. If the brief specifies an exact reply format "
-    "or exact reply text, follow the brief and ignore the headings below. Otherwise report as long as needed but dense "
-    "(soft target 40 lines or fewer), under these fixed headings in this order: Outcome; Problems and deviations "
-    "(anything that failed, was skipped, was assumed, or differs from the brief); Open questions/decisions for the user; "
-    "Changes (every path); Verification (each check with the command and its real exit code/result). "
-    "Never omit failures or deviations to save space. No logs, no file contents, no restating the task."
+INTERNAL_NOTICES = (
+    ("missing tool output", re.compile(r"Custom tool call output is missing for call id")),
+    ("unknown tool process", re.compile(r"codex_core::tools::router:.*write_stdin failed: Unknown process id")),
+    ("model refresh timeout", re.compile(r"failed to refresh available models: request timed out")),
 )
 
 
-HEADING_RE = re.compile(
-    r"^(?:#{1,6}\s+\S.*|\*\*[^*\n]{1,80}\*\*:?"
-    r"|(?:Outcome|Changes|Verification|Problems and deviations|Open questions(?:/decisions)?(?: for the user)?|Summary)"
-    r"(?:\s*\([^)]*\))?\s*:?)\s*$", re.I)
-CRITICAL_RE = re.compile(
-    r"outcome|summary|problem|deviation|question|decision|risk|block|fail|warn|limitation|assum|skip|unfinish|"
-    r"incomplete|caveat|结果|问题|偏差|待决|待定|风险|失败|警告|假设|跳过|未完成|遗留", re.I)
-STUB_RESERVE = 140
+def shell_text(command):
+    try:
+        words = shlex.split(command)
+        if len(words) >= 3 and os.path.basename(words[0]) in ("sh", "bash", "zsh") and words[1] in ("-c", "-lc"):
+            return words[2]
+    except ValueError:
+        pass
+    return command
 
 
-def _heading_title(line):
-    return re.sub(r"^#{1,6}\s+|\*\*|:\s*$", "", line.strip()).strip(" :*")
+def step_kind(command):
+    text = shell_text(command)
+    if re.search(r"\bpython[\d.]*\s+-m\s+(?:unittest|pytest)\b|(?:^|[\n;&|])\s*(?:\S*/)?pytest\b|\bunittest\.main\(|\b(npm|pnpm|yarn|cargo|go|make)\s+test\b", text):
+        return "test"
+    if re.search(r"apply_patch|\b(cat|tee|echo)\b[^\n]*>|\btee\s+\S+|\bsed\s+-i|\bgit\s+(add|mv|rm)\b|\.write(?:_(?:text|bytes))?\(|\bopen\([^\n]*,\s*(?:mode\s*=\s*)?[\"'][wa]|\bperl\s+-[^\s]*i", text):
+        return "edit"
+    if re.search(r"(?:^|[;&|]\s*)\s*(?:cat|head|tail|ls|wc)\b|\bsed\s+-n|\brg\s+--files", text):
+        return "read"
+    if re.search(r"\b(rg|grep|find)\b", text):
+        return "search"
+    if re.search(r"\bgit\b", text):
+        return "git"
+    return "run"
 
 
-def split_sections(text):
-    """[(title or None, block)] where each block starts at its heading line. Text before the first heading has no title."""
-    sections, title, lines = [], None, []
-    for line in text.split("\n"):
-        if HEADING_RE.match(line.strip()):
-            if "".join(lines).strip():
-                sections.append((title, "\n".join(lines)))
-            title, lines = _heading_title(line), [line]
-        else:
-            lines.append(line)
-    if "".join(lines).strip():
-        sections.append((title, "\n".join(lines)))
-    return sections
+def test_result(output):
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    ran = next((line for line in reversed(lines) if re.match(r"Ran \d+ tests?\b", line)), "")
+    for line in reversed(lines):
+        if re.match(r"(?:OK\b|FAILED\s*\()", line):
+            return (ran + " " + line).strip()
+        if re.search(r"\b\d+ (?:passed|failed)\b", line):
+            return line.strip("= ")
+    return ""
 
 
-def _head_tail(text, budget):
-    """Keep the start and the end, cut the middle at line boundaries. Returns (text, omitted_chars)."""
-    if len(text) <= budget:
-        return text, 0
-    lines = text.split("\n")
-    head, used = [], 0
-    for line in lines:
-        if used + len(line) + 1 > int(budget * 0.6):
-            break
-        head.append(line)
-        used += len(line) + 1
-    tail, tail_used = [], 0
-    for line in reversed(lines[len(head):]):
-        if tail_used + len(line) + 1 > int(budget * 0.3):
-            break
-        tail.append(line)
-        tail_used += len(line) + 1
-    tail.reverse()
-    last = next((ln for ln in reversed(lines) if ln.strip()), "")
-    if last and last not in tail and len(lines) > len(head) and len(last) <= budget // 2:
-        tail = [last]  # the final line is where caveats and warnings tend to be: always keep it when it fits
-        tail_used = len(last) + 1
-    if not head and not tail:  # one enormous line: keep both ends of it
-        a, z = int(budget * 0.6), int(budget * 0.3)
-        omitted = max(len(text) - a - z, 0)
-        return text[:a] + f"\n[... {omitted} chars omitted from the middle ...]\n" + text[len(text) - z:], omitted
-    omitted = max(len(text) - used - tail_used, 0)
-    return "\n".join(head + [f"[... {omitted} chars omitted from the middle; they may hold important details ...]"] + tail), omitted
+def update_steps(stats, item):
+    kind = step_kind(item.get("command", ""))
+    stats[kind] = stats.get(kind, 0) + 1
+    if kind == "test":
+        stats["test_failed"] = stats.get("test_failed", 0) + int(item.get("exit_code") not in (0, None))
+        result = test_result(item.get("aggregated_output") or "")
+        if result:
+            stats["last_test"] = result
 
 
-def brief_text(text, limit):
-    """Cap Codex's final message without losing what matters. Returns (summary, omitted_chars).
-    Structured reports keep the critical sections (outcome, problems, deviations, open questions) whole and
-    drop or trim the bulky ones (changes, verification) first, leaving a stub that names what was left out.
-    Unstructured text keeps its head AND its tail, because the end is often where the caveats are."""
-    if len(text) <= limit:
-        return text, 0
-    sections = split_sections(text)
-    titled = [i for i, (t, _) in enumerate(sections) if t]
-    if len(titled) < 2:
-        return _head_tail(text, limit)
-    first = titled[0]
-    critical = [i for i, (t, _) in enumerate(sections) if t is None or i == first or CRITICAL_RE.search(t)]
-    others = [i for i in range(len(sections)) if i not in critical]
-    kept, omitted = {}, 0
-    crit_budget = max(limit - STUB_RESERVE * len(others), limit // 2)
-    if sum(len(sections[i][1]) for i in critical) <= crit_budget:
-        for i in critical:
-            kept[i] = sections[i][1]
-    else:
-        share = max(crit_budget // len(critical), 200)
-        for i in critical:
-            kept[i], cut = _head_tail(sections[i][1], share)
-            omitted += cut
-    avail = limit - sum(len(v) for v in kept.values())
-    for pos, i in enumerate(others):
-        title, block = sections[i]
-        after = len(others) - pos - 1
-        room = avail - STUB_RESERVE * after
-        if len(block) <= room:
-            kept[i] = block
-            avail -= len(block)
-        elif room >= 350:
-            kept[i], cut = _head_tail(block, room)
-            omitted += cut
-            avail -= len(kept[i])
-        else:
-            kept[i] = f'[omitted section "{title}" ({len(block)} chars); get it with: result --section "{title}"]'
-            omitted += len(block)
-    return "\n".join(kept[i] for i in range(len(sections))), omitted
+def steps_line(stats):
+    kinds = ("read", "search", "edit", "test", "git", "run")
+    parts = []
+    for kind in kinds:
+        if stats.get(kind):
+            part = str(stats[kind]) + " " + ("other" if kind == "run" else kind)
+            if kind == "test":
+                part += " (" + str(stats.get("test_failed", 0)) + " failed"
+                if stats.get("last_test"):
+                    part += ", last: " + stats["last_test"]
+                part += ")"
+            parts.append(part)
+    return _short("steps: " + str(sum(stats.get(k, 0) for k in kinds)) + " = " + (", ".join(parts) or "none"), 200)
+
+
+def step_description(command):
+    text = shell_text(command)
+    heredoc = re.search(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n", text)
+    inline = re.search(r"\b(python[\d.]*|perl|ruby|node|bash|sh)\s+-[ce]\b", text)
+    if heredoc or inline:
+        interpreter = re.search(r"\b(python[\d.]*|perl|ruby|node|bash|sh|cat|tee)\b", text)
+        name = interpreter.group(1) if interpreter else "shell"
+        body = text[heredoc.end():].splitlines() if heredoc else text.splitlines()
+        if heredoc:
+            body = body[:next((i for i, line in enumerate(body) if line.strip() == heredoc.group(1)), len(body))]
+        # Only shell redirections on the heredoc header are evidence of a write;
+        # a comparison such as `if n > 1` in the script body is not a path.
+        header = text.splitlines()[0] if heredoc else ""
+        path = re.search(r"(?:>{1,2}\s*|\btee\s+)([^\s<>]+)", header)
+        if not path:
+            path = re.search(r"Path\(['\"]([^'\"]+)['\"]\)\.write|open\(['\"]([^'\"]+)['\"]\s*,\s*['\"][wa]", text)
+        target = next((value for value in path.groups() if value is not None), "") if path else ""
+        return "script " + name + " (" + str(len(body)) + " lines)" + (" writes " + target.strip("'\"") if target else "")
+    return " ".join(text.split())
+
+
+def trace_label(command):
+    description = step_description(command)
+    if description.startswith("script "):
+        return description.split(" writes ", 1)[-1] if " writes " in description else description
+    try:
+        words = shlex.split(shell_text(command))
+        return next((w for w in reversed(words) if not w.startswith("-") and w not in ("cat", "ls")), "-")
+    except ValueError:
+        return step_description(command)
+
+
+def compact_trace(jid):
+    """Render execution facts, keeping failures even when they exceed the size target."""
+    import difflib
+    st = _jread(jid)
+    rows, commands, notices = [], {}, {}
+    path = Path(_job_path(jid, "events.jsonl"))
+    if path.exists():
+        with path.open() as stream:
+            for line in stream:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    ev = {"type": "raw", "text": line.rstrip()}
+                item = ev.get("item") or {}
+                kind = item.get("type")
+                if kind == "command_execution":
+                    key = item.get("id")
+                    row = commands.get(key) if key is not None else None
+                    if row is None:
+                        row = {"type": "command", "item": {}, "number": len(commands) + 1}
+                        commands[key if key is not None else object()] = row
+                        rows.append(row)
+                    row["item"].update(item)
+                    continue
+                message = event_notice(ev)
+                raw = ev.get("text", "") if ev.get("type") == "raw" else ""
+                if message is None and re.search(r"\b(?:warn(?:ing)?|error)\b", raw, re.IGNORECASE):
+                    message = raw
+                internal = next((name for name, pattern in INTERNAL_NOTICES if pattern.search(message or raw)), None)
+                if internal:
+                    notices[internal] = notices.get(internal, 0) + 1
+                elif message:
+                    rows.append({"type": "notice", "text": message[:500] + ("…" if len(message) > 500 else "")})
+                elif ev.get("type") == "item.completed" and kind == "collab_tool_call":
+                    tool = item.get("tool", "call").replace("_agent", "")
+                    rows.append({"type": "collab", "text": "» sub-agents: " + tool + " x" + str(len(collab_receivers(ev)))})
+                elif ev.get("type") == "item.completed" and kind == "agent_message":
+                    text = " ".join(item.get("text", "").split())
+                    text = re.split(r"(?<=[.!?])\s+|(?<=[。！？])", text, maxsplit=1)[0]
+                    text = _short(text, 140)
+                    if not text or re.fullmatch(r"(?i)(ok|okay|sure|understood|got it|done|ready)[.! ]*", text):
+                        continue
+                    if rows and rows[-1]["type"] == "narration" and difflib.SequenceMatcher(None, rows[-1]["text"], text).ratio() > .8:
+                        continue
+                    rows.append({"type": "narration", "text": text})
+    failed = sum(row["item"].get("exit_code") not in (0, None) for row in commands.values())
+    code = st.get("exit_code")
+    print(f"trace job={jid} status={st.get('status', '?')} exit={code if code is not None else '-'} steps={len(commands)} failed={failed}")
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        i += 1
+        if row["type"] != "command":
+            print(("» " if row["type"] == "narration" else "") + row["text"])
+            continue
+        item = row["item"]
+        kind = step_kind(item.get("command", ""))
+        group = [row]
+        while item.get("exit_code") == 0 and i < len(rows) and rows[i]["type"] == "command":
+            other = rows[i]["item"]
+            if other.get("exit_code") != 0 or step_kind(other.get("command", "")) != kind:
+                break
+            group.append(rows[i])
+            i += 1
+        description = step_description(item.get("command", ""))
+        if len(group) > 1:
+            if all(r["item"].get("command") == item.get("command") for r in group):
+                description += " x" + str(len(group))
+            else:
+                labels = []
+                repeats = 0
+                previous = None
+                for member in group:
+                    command = member["item"].get("command", "")
+                    if command == previous:
+                        repeats += 1
+                        labels[-1] = trace_label(command) + " x" + str(repeats)
+                    else:
+                        labels.append(trace_label(command))
+                        previous, repeats = command, 1
+                description = kind + "s x" + str(len(group)) + ": " + ", ".join(labels[:3])
+                if len(labels) > 3:
+                    description += " +" + str(len(labels) - 3)
+        code = item.get("exit_code")
+        number = str(row["number"]).zfill(2)
+        if len(group) > 1:
+            number += "-" + str(group[-1]["number"]).zfill(2)
+        outputs = [str(r["item"].get("aggregated_output") or "") for r in group]
+        count = sum(len(out.splitlines()) for out in outputs)
+        print(number + (" ✓ " if code == 0 else " ? " if code is None else " ✗ ") + kind + " " + _short(description, 110) +
+              " [exit " + str(code if code is not None else "?") + "]" + (" (+" + str(count) + " out lines)" if count else ""))
+        if kind == "test":
+            result = next((test_result(out) for out in reversed(outputs) if test_result(out)), "")
+            if result:
+                print("  " + _short(result, 200))
+        if code not in (0, None):
+            output = outputs[0]
+            names = [line for line in output.splitlines() if re.match(r"(?:FAIL:|ERROR:|FAILED\s+\S+::)", line)]
+            if kind == "test":
+                for name in names[:5]:
+                    print("  " + name)
+            for line in [line for line in output.splitlines() if line.strip()][-3:]:
+                print("  " + line)
+    if notices:
+        print("internal notices: " + ", ".join(name + " x" + str(count) for name, count in notices.items()))
+    print("detail: " + bridge_command("log", jid, "--full"))
 
 
 def event_notice(event):
@@ -807,6 +907,8 @@ def activity_digest(facts, state=None):
     parts.append(f"tokens in/out {usage.get('input_tokens', '?')}/{usage.get('output_tokens', '?')}")
     parts.append("quota: " + (facts.get("quota") or "unavailable"))
     lines = [" · ".join(parts)]
+    if "steps" in facts:
+        lines.append(steps_line(facts["steps"]))
     for failure in facts.get("failures", []):
         lines.append("  failed command: " + command_line(failure))
         lines.extend("    " + line for line in failure["tail"])
@@ -853,7 +955,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     usage, cfg, jid, digest). live=True also prints a readable timeline to stderr as it happens."""
     s = load()
     cfg = dict(cfg)
-    for key in ("subagents", "max_subagents", "brief_chars"):
+    for key in ("subagents", "max_subagents"):
         cfg[key] = validate(key, cfg.get(key, s[key]))
     validate_model(cfg, cd)
     if resume and cfg["sandbox"] not in SANDBOXES:
@@ -862,7 +964,6 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     if jid is None:
         jid = new_run(kind, cfg, prompt, cdir, review, name=name)
     if review is None and prompt is not None:
-        prompt = FINAL_MESSAGE_CONTRACT + "\n\n" + prompt
         dispatch = dispatch_prompt(cfg, s)
         if dispatch:
             prompt = dispatch + "\n\n" + prompt
@@ -907,6 +1008,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
     subagent_ids, subagent_meta = set(), {}
     failures, notices, notice_count = [], [], 0
     unattributed_collab = 0
+    steps = {}
     raw_tail = deque(maxlen=20)
     final = ""
     execution_failed = False
@@ -964,6 +1066,7 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                         errors.append(it.get("message", ""))
                     elif it.get("type") == "command_execution":
                         cmds += 1
+                        update_steps(steps, it)
                         failed += it.get("exit_code") not in (0, None)
                         if it.get("exit_code") not in (0, None) and len(failures) < 5:
                             failures.append(command_record(it))
@@ -978,7 +1081,8 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
                     for ln in render_event(ev):
                         print(ln, file=sys.stderr, flush=True)
             p.wait(timeout=REAP_TIMEOUT)
-            final = Path(out).read_text().strip()
+            with Path(out).open(newline="") as stream:
+                final = stream.read()
     except subprocess.TimeoutExpired:
         timed_out.append(True)
     except Exception as exc:
@@ -1032,11 +1136,10 @@ def exec_codex(cfg, prompt, cd=None, add_dir=None, session=None, resume=False, r
              "interrupted": state.get("cleanup_target") if state.get("status") in ACTIVE else None,
              "agents": {tid: subagent_meta.get(tid, {}) for tid in sorted(subagent_ids)},
              "subagents": cfg["subagents"], "unattributed_collab": unattributed_collab,
-             "usage": res["usage"], "quota": res["quota"]}
+             "usage": res["usage"], "quota": res["quota"], "steps": steps}
     res["digest"] = activity_digest(facts, state)
-    summary, more = brief_text(res["text"], cfg["brief_chars"])
     _jwrite(jid, digest=res["digest"], activity=facts, thread=res["thread"], quota=res["quota"], exit_code=res["exit_code"],
-            summary=summary, summary_more_chars=more, subagent_count=res["subagent_count"])
+            subagent_count=res["subagent_count"])
     return res
 
 
@@ -1101,38 +1204,39 @@ def bridge_command(*args):
 
 
 def print_footer(r):
-    print(f"transcript: {bridge_command('log', r['jid'])}")
-    print(f"take over: {bridge_command('attach', r['jid'])}")
+    jid = r["jid"]
+    print("more: " + " | ".join(bridge_command(*args) for args in (
+        ("log", jid), ("log", jid, "--failed"), ("log", jid, "--grep", "P"), ("attach", jid))))
 
 
-def print_brief(jid):
+def saved_report(jid):
+    path = Path(_job_path(jid, "result.txt"))
+    if path.exists():
+        with path.open(newline="") as stream:
+            return stream.read()
+    return ""
+
+
+def print_report(jid):
     st = _jread(jid) or {}
     status = st.get("status", "failed")
     if status == "failed" and st.get("timed_out"):
         status = "timeout"
     code = st.get("exit_code")
     print(f"codex {status} exit={code if code is not None else '-'} job={jid} session={st.get('thread') or '-'}")
-    summary = st.get("summary")
-    more = st.get("summary_more_chars", 0)
-    if summary is None:  # Older jobs still have their result file.
-        path = Path(_job_path(jid, "result.txt"))
-        text = path.read_text() if path.exists() else ""
-        limit = load()["brief_chars"]
-        summary, more = brief_text(text, limit)
-    print("summary: " + summary)
-    if more:
-        print(f"... [{more} more chars; full text: {bridge_command('result', jid, '--full')}]")
+    print("report:")
+    text = saved_report(jid)
+    sys.stdout.write(text)
+    if text and not text.endswith("\n"):
+        print()
     print("activity: " + (activity_digest(st["activity"], st) if st.get("activity") else st.get("digest", "")))
     if status in ("failed", "timeout", "cleanup_pending"):
         print("error: " + st.get("error", "")[-1200:])
-        print("transcript: " + bridge_command("log", jid, "--tail", "40"))
-        print("take over: " + bridge_command("attach", jid))
-    else:
-        print_footer({"jid": jid})
+    print_footer({"jid": jid})
 
 
 def report_run(r):
-    print_brief(r["jid"])
+    print_report(r["jid"])
     if not r["ok"]:
         sys.exit(1)
 
@@ -1546,7 +1650,7 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
     _jwrite(jid, id=jid, kind=kind, status="running", cwd=os.path.realpath(cd), model=cfg["model"], effort=cfg["effort"],
             started=time.time(), pid=os.getpid(), pgid=None, name=name, sandbox=cfg["sandbox"], profile=cfg["profile"],
             codex_memory=cfg.get("session_memory", load().get("codex_memory", "scoped")), native_review=review is not None,
-            exit_code=None, summary="", summary_more_chars=0,
+            exit_code=None,
             subagents=cfg.get("subagents", load()["subagents"]), max_subagents=cfg.get("max_subagents", load()["max_subagents"]),
             title=(prompt or " ".join(review or []))[:70].replace("\n", " "))
     return jid
@@ -1555,10 +1659,7 @@ def new_run(kind, cfg, prompt, cd, review=None, spec=None, name=None):
 def finish_run(r):
     with job_state(r["jid"]) as st:
         st["worker_finished"] = True
-        limit = r.get("cfg", {}).get("brief_chars", load()["brief_chars"])
-        text = r.get("text", "")
-        summary, more = brief_text(text, limit)
-        st.update(exit_code=r.get("exit_code"), summary=summary, summary_more_chars=more)
+        st.update(exit_code=r.get("exit_code"))
         if st.get("status") in ("cancelled", "steered"):
             return
         if r.get("cleanup_pending"):
@@ -1567,12 +1668,11 @@ def finish_run(r):
                       cleanup_error=r["cleanup_error"], error=r["error"],
                       timed_out=r.get("timed_out", False), usage=r["usage"])
             st.pop("finished", None)
-            Path(_job_path(r["jid"], "result.txt")).write_text("CLEANUP PENDING: " + r["error"])
+            Path(_job_path(r["jid"], "result.txt")).write_text(r.get("text", ""))
             return
         if st.get("status") in ("cancelling", "cleanup_pending"):
             return
-        Path(_job_path(r["jid"], "result.txt")).write_text(
-            r["text"] if r["ok"] else (r["text"] + "\n\n" if r["text"] else "") + "FAILED: " + r["error"])
+        Path(_job_path(r["jid"], "result.txt")).write_text(r["text"])
         st.update(status="done" if r["ok"] else "failed", usage=r["usage"],
                   error=r["error"], timed_out=r.get("timed_out", False), finished=time.time())
 
@@ -1693,10 +1793,12 @@ def _refresh(jid):
 
 
 def compact_state(st):
-    state = {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error", "steered_to", "steered_from", "exit_code", "summary", "subagents", "subagent_count")}
+    state = {k: st.get(k) for k in ("id", "status", "name", "thread", "model", "effort", "sandbox", "digest", "error", "steered_to", "steered_from", "exit_code", "subagents", "subagent_count")}
 
     if st.get("activity"):
         state["digest"] = activity_digest(st["activity"], st)
+    facts = st.get("activity") or {}
+    state["counts"] = {key: facts.get(key) for key in ("commands", "failed_count", "notice_count")}
     if state.get("error"):
         state["error"] = state["error"][-1200:]
     return state
@@ -1724,21 +1826,10 @@ def cmd_result(a):
     jid = _resolve_job(a.job, getattr(a, "name", None)); st = _refresh(jid)
     if st["status"] in ACTIVE:
         print(f"job {jid} still running"); return
-    wanted = getattr(a, "section", None)
-    path = Path(_job_path(jid, "result.txt"))
-    if wanted:
-        text = path.read_text() if path.exists() else ""
-        secs = split_sections(text)
-        hits = [block for title, block in secs if title and wanted.lower() in title.lower()]
-        if hits:
-            print("\n\n".join(hits))
-        else:
-            names = [title for title, _ in secs if title]
-            print(f'no section matching "{wanted}"; available: ' + (", ".join(names) if names else "(the result has no headings; use --full)"))
-    elif getattr(a, "full", False):
-        print(path.read_text() if path.exists() else st.get("error", ""))
+    if getattr(a, "full", False):
+        sys.stdout.write(saved_report(jid))
     else:
-        print_brief(jid)
+        print_report(jid)
 
 
 def cmd_wait(a):
@@ -1748,7 +1839,7 @@ def cmd_wait(a):
         if time.time() - t0 > a.timeout:
             print(f"job {jid} still running after {a.timeout}s"); return
         time.sleep(3)
-    cmd_result(argparse.Namespace(job=jid, full=getattr(a, "full", False), section=getattr(a, "section", None)))
+    cmd_result(argparse.Namespace(job=jid, full=getattr(a, "full", False)))
 
 
 def legacy_process(jid, st):
@@ -1942,7 +2033,7 @@ def targeted_log(jid, a):
             pattern = re.compile(a.grep)
         except re.error as exc:
             sys.exit(f"invalid --grep pattern: {exc}")
-    since, tail = getattr(a, "since", 0), getattr(a, "tail", None)
+    since, tail = getattr(a, "since", None) or 0, getattr(a, "tail", None)
     if since < 0 or (tail is not None and tail < 0):
         sys.exit("--since and --tail must be nonnegative")
     events, cursor = [], 0
@@ -1992,7 +2083,9 @@ def cmd_log(a):
     jid = _resolve_job(a.job, getattr(a, "name", None))
     if getattr(a, "failed", False) or getattr(a, "commands", False) or getattr(a, "grep", None) is not None:
         return targeted_log(jid, a)
-    _stream(jid, follow=False, full=a.full, since=getattr(a, "since", 0), tail=getattr(a, "tail", None))
+    if a.full or getattr(a, "since", None) is not None or getattr(a, "tail", None) is not None:
+        return _stream(jid, follow=False, full=a.full, since=getattr(a, "since", None) or 0, tail=getattr(a, "tail", None))
+    compact_trace(jid)
 
 
 def cmd_attach(a):
@@ -2076,7 +2169,7 @@ def cmd_parallel(a):
         results = list(ex.map(one, enumerate(tasks)))
     failed = 0
     for name, role, r in results:
-        print_brief(r["jid"])
+        print_report(r["jid"])
         failed += not r["ok"]
     sys.exit(1 if failed else 0)
 
@@ -2113,7 +2206,7 @@ def main():
         r.add_argument("--role", help="explorer|worker|debugger|reviewer|architect|custom")
         r.add_argument("--cd"); r.add_argument("--add-dir", action="append")
         r.add_argument("--timeout", type=int); r.add_argument("--profile")
-        r.add_argument("--live", action="store_true", help="print human timeline to stderr (default: brief output only)")
+        r.add_argument("--live", action="store_true", help="print human timeline to stderr (default: final report only)")
         r.add_argument("--subagents", help="none|auto|active; prompt-level dispatch policy")
         r.add_argument("--max-subagents", type=int, help="maximum concurrent sub-agents, 1..20")
         r.add_argument("--background", action="store_true", help="return a job id immediately")
@@ -2137,18 +2230,17 @@ def main():
     for n in ("watch", "log", "attach"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
         if n == "log":
-            q.add_argument("--full", action="store_true")
+            q.add_argument("--full", action="store_true", help="detailed transcript instead of the compact execution trace")
             filters = q.add_mutually_exclusive_group()
             filters.add_argument("--failed", action="store_true", help="failed commands with exit codes and last 3 output lines")
             filters.add_argument("--commands", action="store_true", help="every command, one line each, with exit code")
             filters.add_argument("--grep", metavar="PATTERN", help="regex over rendered lines, with 2 lines of context")
-            q.add_argument("--since", type=int, default=0); q.add_argument("--tail", type=int)
+            q.add_argument("--since", type=int, default=None); q.add_argument("--tail", type=int)
         if n == "attach": q.add_argument("--force", action="store_true")
     for n in ("result", "cancel", "wait"):
         q = sub.add_parser(n); q.add_argument("job", nargs="?", default="last"); q.add_argument("--name")
         if n in ("result", "wait"):
-            q.add_argument("--full", action="store_true", help="print the full saved result instead of a capped summary")
-            q.add_argument("--section", metavar="NAME", help="print only the report section whose heading contains NAME")
+            q.add_argument("--full", action="store_true", help="print only the verbatim saved report")
         if n == "wait": q.add_argument("--timeout", type=int, default=600)
     steer = sub.add_parser("steer", help="interrupt safely and guide the same session (background by default)")
     steer.add_argument("job", nargs="?", default="last")

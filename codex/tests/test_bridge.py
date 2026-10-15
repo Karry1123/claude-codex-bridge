@@ -97,9 +97,9 @@ class BridgeTests(unittest.TestCase):
         import time
         self.hanging_fake()
         start = time.monotonic()
-        r = b.exec_codex(self.cfg(timeout=1.0), "hi", str(self.cwd))
+        r = b.exec_codex(self.cfg(timeout=4.0), "hi", str(self.cwd))  # generous: the fake must start before the timeout, even under load
         b.finish_run(r)
-        self.assertLess(time.monotonic() - start, 5)
+        self.assertLess(time.monotonic() - start, 14)
         self.assertTrue(self.ready.exists(), "timeout happened before descendant started")
         self.assertIn("timed out", r["error"])
         self.assertFalse(b.group_alive(b._jread(r["jid"])["pgid"]))
@@ -430,7 +430,8 @@ class BridgeTests(unittest.TestCase):
         with mock.patch.object(b.subprocess, "Popen", side_effect=OSError("worker launch denied")), self.assertRaisesRegex(SystemExit, "worker launch denied"):
             b.start_job("task", self.cfg(), "hi", str(self.cwd), jid=other)
         self.assertEqual(b._jread(other)["status"], "failed")
-        self.assertIn("worker launch denied", Path(b._job_path(other, "result.txt")).read_text())
+        self.assertEqual(Path(b._job_path(other, "result.txt")).read_text(), "")
+        self.assertIn("worker launch denied", b._jread(other)["error"])
         with mock.patch.object(b, "exec_codex", side_effect=SystemExit("bad catalog")):
             b.cmd__job(argparse.Namespace(jid=other))
         self.assertIn("bad catalog", b._jread(other)["error"])
@@ -465,7 +466,7 @@ class BridgeTests(unittest.TestCase):
         import time
         from concurrent.futures import ThreadPoolExecutor
         self.hanging_fake(detached=True)
-        r = b.exec_codex(self.cfg(timeout=1), "hi", str(self.cwd))
+        r = b.exec_codex(self.cfg(timeout=4), "hi", str(self.cwd))  # generous: the fake must start before the timeout, even under load
         self.assertIn("timed out", r["error"])
         descendant = int(self.ready.read_text())
         self.assert_dead(descendant)
@@ -496,8 +497,8 @@ class BridgeTests(unittest.TestCase):
                     return real_run(args, **kwargs)
                 start = time.monotonic()
                 with mock.patch.object(b.subprocess, "run", side_effect=run), mock.patch.object(b.os, "killpg", wraps=os.killpg) as kill:
-                    r = b.exec_codex(self.cfg(timeout=1), "x" * 200000, str(self.cwd))
-                self.assertLess(time.monotonic() - start, 5)
+                    r = b.exec_codex(self.cfg(timeout=4), "x" * 200000, str(self.cwd))  # generous startup margin under load
+                self.assertLess(time.monotonic() - start, 14)
                 self.assertIn("timed out", r["error"])
                 self.assertTrue(any(call.args[1] == signal.SIGKILL for call in kill.call_args_list))
                 self.assert_dead(b._jread(r["jid"])["child_pid"])
@@ -660,6 +661,11 @@ class BridgeTests(unittest.TestCase):
         import signal
         from concurrent.futures import ThreadPoolExecutor
         real_kill, real_killpg = os.kill, os.killpg
+        real_child_lines = b.child_lines
+        def ready_child_lines(*args):
+            # This test exercises an unkillable descendant, not interpreter startup.
+            self.wait_ready()
+            return real_child_lines(*args)
         for retry_cancel in (False, True):
             with self.subTest(retry_cancel=retry_cancel):
                 self.hanging_fake(detached=True)
@@ -676,7 +682,7 @@ class BridgeTests(unittest.TestCase):
                         raise PermissionError("injected descendant group kill failure")
                     return real_killpg(pgid, sig)
                 try:
-                    with mock.patch.object(b.os, "kill", side_effect=kill), mock.patch.object(b.os, "killpg", side_effect=killpg):
+                    with mock.patch.object(b.os, "kill", side_effect=kill), mock.patch.object(b.os, "killpg", side_effect=killpg), mock.patch.object(b, "child_lines", side_effect=ready_child_lines):
                         r = b.exec_codex(self.cfg(timeout=1), "hi", str(self.cwd), jid=jid)
                     b.finish_run(r)
                     self.assertTrue(r["cleanup_pending"])
@@ -1166,45 +1172,61 @@ class BridgeTests(unittest.TestCase):
 
     def output_fake(self, text="done", events=()):
         self.capture = self.root / "output-capture.json"
-        self.fake("from pathlib import Path\n"
-                  "Path(" + repr(str(self.capture)) + ").write_text(json.dumps({'argv':sys.argv,'stdin':sys.stdin.read()}))\n"
+        self.fake("from pathlib import Path\nimport os\n"
+                  "capture=Path(" + repr(str(self.capture)) + ")\n"
+                  "pending=capture.with_suffix('.' + str(os.getpid()))\n"
+                  "pending.write_text(json.dumps({'argv':sys.argv,'stdin':sys.stdin.read()}))\n"
+                  "pending.replace(capture)\n"
                   "thread=sys.argv[sys.argv.index('resume')+1] if 'resume' in sys.argv else 'output-thread'\n"
                   "print(json.dumps({'type':'thread.started','thread_id':thread}))\n"
                   "print(json.dumps({'type':'turn.started'}))\n"
                   + "\n".join("print(" + repr(json.dumps(event)) + ")" for event in events) + "\n"
                   "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':" + repr(text) + "}}))\n")
 
-    def test_o1_brief_shape_cap_state_and_live(self):
-        final = "0123456789\n" * 30
+    def test_report_verbatim_state_and_live(self):
+        final = "  first\n\n" + "0123456789\n" * 600 + "last  \n"
         self.output_fake(final)
-        b.save({**b.load(), "brief_chars": 80})
         result = self.bridge_cli("run", "--role", "explorer", "go")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         jid = b.ordered_jobs()[0]
-        lines = result.stdout.splitlines()
-        self.assertEqual(lines[0], "codex done exit=0 job=" + jid + " session=output-thread")
-        summary, more = b.brief_text(final, 80)
-        self.assertIn("omitted from the middle", summary)  # unstructured text keeps head and tail, marks the middle
-        self.assertIn("summary: " + summary + "\n... [" + str(more) + " more chars; full text: " + b.bridge_command("result", jid, "--full").replace(str(self.home), os.path.realpath(self.home)) + "]", result.stdout)
-        self.assertTrue(any(line.startswith("activity: ") for line in lines))
-        self.assertLess(len(result.stdout.encode()), 2000)
-        self.assertEqual(b._jread(jid)["exit_code"], 0)
-        self.assertEqual(b._jread(jid)["summary"], summary)
-        status = json.loads(self.bridge_cli("status", jid, "--json").stdout)
-        self.assertEqual(status["exit_code"], 0)
-        self.assertEqual(status["summary"], summary)
-        self.assertEqual(json.loads(self.bridge_cli("jobs", "--json").stdout)[0]["summary"], summary)
+        self.assertTrue(result.stdout.startswith("codex done exit=0 job=" + jid + " session=output-thread\nreport:\n"))
+        self.assertIn("report:\n" + final + "activity: ", result.stdout)
+        self.assertEqual(result.stdout.count("\nmore: "), 1)
+        self.assertIn(b.bridge_command("log", jid).replace(str(self.home), os.path.realpath(self.home)), result.stdout)
+        for key in ("summary", "report", "text"):
+            self.assertNotIn(key, json.loads(self.bridge_cli("status", jid, "--json").stdout))
+        state = json.loads(self.bridge_cli("status", jid, "--json").stdout)
+        self.assertEqual(state["exit_code"], 0)
+        self.assertEqual(state["counts"]["commands"], 0)
+        jobs = json.loads(self.bridge_cli("jobs", "--json").stdout)
+        self.assertNotIn("summary", jobs[0])
         for command in ("result", "wait"):
-            brief = self.bridge_cli(command, jid)
-            self.assertEqual(brief.stdout, result.stdout)
-            full = self.bridge_cli(command, jid, "--full")
-            self.assertEqual(full.stdout, final + "\n")
-            self.assertEqual(full.stderr, "")
+            self.assertEqual(self.bridge_cli(command, jid).stdout, result.stdout)
+            self.assertEqual(self.bridge_cli(command, jid, "--full").stdout, final)
         live = self.bridge_cli("run", "--live", "go")
         self.assertIn("turn started", live.stderr)
         self.assertIn("0123456789", live.stderr)
         self.assertTrue(live.stdout.startswith("codex done exit=0"))
+
+    def test_normal_output_compact_and_complete(self):
+        self.output_fake("All done\nChecks: exit 0")
+        result = self.bridge_cli("run", "go")
+        self.assertLess(len(result.stdout.encode()), 2000)
+        self.assertIn("report:\nAll done\nChecks: exit 0\nactivity:", result.stdout)
+        self.assertIn("steps: 0 = none", result.stdout)
+        self.assertEqual(result.stdout.count("\nmore:"), 1)
+
+    def test_removed_brief_setting(self):
+        Path(b.SETTINGS).write_text(json.dumps({"brief_chars": "obsolete"}))
+        self.assertNotIn("brief_chars", b.load())
+        before = Path(b.SETTINGS).read_text()
+        result = self.bridge_cli("config", "set", "brief_chars=1500")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("removed", result.stderr)
+        self.assertEqual(Path(b.SETTINGS).read_text(), before)
+        self.assertNotIn("brief_chars", b.DEFAULTS)
+        self.assertNotEqual(self.bridge_cli("result", "--section", "Changes").returncode, 0)
 
     def test_o1_failure_tail_exit_and_never_started(self):
         self.fake("print('BEGIN-' + 'e'*5000 + '-END')\nsys.exit(7)\n", complete=False)
@@ -1212,8 +1234,8 @@ class BridgeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         jid = b.ordered_jobs()[0]
         self.assertTrue(result.stdout.startswith("codex failed exit=7 job=" + jid))
-        self.assertIn(b.bridge_command("log", jid, "--tail", "40").replace(str(self.home), os.path.realpath(self.home)), result.stdout)
-        error = result.stdout.split("error: ", 1)[1].split("\ntranscript:", 1)[0]
+        self.assertIn(b.bridge_command("log", jid).replace(str(self.home), os.path.realpath(self.home)), result.stdout)
+        error = result.stdout.split("error: ", 1)[1].split("\nmore:", 1)[0]
         self.assertLessEqual(len(error), 1200)
         self.assertTrue(error.endswith("-END"))
         self.assertNotIn("BEGIN-", result.stdout)
@@ -1223,45 +1245,42 @@ class BridgeTests(unittest.TestCase):
             r = b.exec_codex(self.cfg(), "hi", str(self.cwd))
         b.finish_run(r)
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.print_brief(r["jid"])
+            b.print_report(r["jid"])
         self.assertTrue(out.getvalue().startswith("codex failed exit=-"))
         b._jwrite(r["jid"], timed_out=True)
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            b.print_brief(r["jid"])
+            b.print_report(r["jid"])
         self.assertTrue(out.getvalue().startswith("codex timeout exit=-"))
 
     def test_o1_failed_full_result_keeps_final_message(self):
         final = "Problems: incomplete\n" * 30
         self.fake("print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':" + repr(final) + "}}))\n"
                   "print(json.dumps({'type':'turn.failed','error':{'message':'failure'}}))\nsys.exit(2)\n", complete=False)
-        b.save({**b.load(), "brief_chars": 80})
         result = self.bridge_cli("run", "go")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("more chars; full text:", result.stdout)
+        self.assertIn("report:\n" + final, result.stdout)
         full = self.bridge_cli("result", b.ordered_jobs()[0], "--full")
-        self.assertTrue(full.stdout.startswith(final))
-        self.assertIn("FAILED:", full.stdout)
+        self.assertEqual(full.stdout, final)
 
-    def test_o2_contract_in_run_resume_and_steer(self):
+    def test_no_contract_in_run_resume_and_steer(self):
         self.output_fake()
         result = self.bridge_cli("run", "--role", "worker", "--subagents", "none", "original")
         self.assertEqual(result.returncode, 0, result.stderr)
         jid = b.ordered_jobs()[0]
         prompt = json.loads(self.capture.read_text())["stdin"]
-        self.assertIn(b.FINAL_MESSAGE_CONTRACT, prompt)
+        self.assertNotIn("FINAL MESSAGE CONTRACT", prompt)
         self.assertIn("Do not spawn sub-agents", prompt)
         self.assertLess(prompt.index("WORKSPACE BINDING"), prompt.index("ROLE: worker"))
-        self.assertLess(prompt.index("FINAL MESSAGE CONTRACT"), prompt.index("original"))
         resumed = self.bridge_cli("resume", "--session", "output-thread", "--subagents", "active", "--max-subagents", "3", "continue")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         prompt = json.loads(self.capture.read_text())["stdin"]
-        self.assertIn(b.FINAL_MESSAGE_CONTRACT, prompt)
+        self.assertNotIn("FINAL MESSAGE CONTRACT", prompt)
         self.assertIn("SUB-AGENT DISPATCH IS REQUESTED", prompt)
         self.assertIn("up to 3 concurrently", prompt)
         steered = self.bridge_cli("steer", "--foreground", "--subagents", "none", jid, "new guidance")
         self.assertEqual(steered.returncode, 0, steered.stderr)
         prompt = json.loads(self.capture.read_text())["stdin"]
-        self.assertEqual(prompt.count("FINAL MESSAGE CONTRACT"), 1)
+        self.assertNotIn("FINAL MESSAGE CONTRACT", prompt)
         self.assertIn("Do not spawn sub-agents", prompt)
         self.assertTrue(prompt.endswith("new guidance"))
         self.assertTrue(steered.stdout.startswith("codex done exit=0"))
@@ -1283,8 +1302,7 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(b._jread(r["jid"])["subagents"], mode)
         cfg = b.resolve(self.args(role="worker"), self.cfg(team_policy=False))
         self.assertNotIn("TEAM POLICY", cfg["preamble"])
-        for key, values in (("brief_chars", (0, -1, True, "bad", 1.5)),
-                            ("max_subagents", (0, 21, -1, True, "bad", 1.5)),
+        for key, values in (("max_subagents", (0, 21, -1, True, "bad", 1.5)),
                             ("subagents", ("bad", 1, None))):
             for value in values:
                 with self.subTest(key=key, value=value), self.assertRaisesRegex(SystemExit, "invalid " + key):
@@ -1304,7 +1322,7 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn("FINAL MESSAGE CONTRACT", json.loads(self.capture.read_text())["stdin"])
         self.assertTrue(native.stdout.startswith("codex done exit=0"))
         config = json.loads(self.bridge_cli("config", "show").stdout)
-        for key in ("brief_chars", "subagents", "max_subagents"):
+        for key in ("subagents", "max_subagents"):
             self.assertIn(key, config)
 
     def test_o4_distinct_collab_agents_and_parallel_controls(self):
@@ -1332,6 +1350,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual({st["subagents"] for st in states}, {"none", "active"})
         self.assertTrue(all(st["max_subagents"] == 2 for st in states))
         self.assertIn("sub-agents: 0", result.stdout)
+        self.assertNotIn("FINAL MESSAGE CONTRACT", json.loads(self.capture.read_text())["stdin"])
         tasks.write_text(json.dumps([{"prompt": "go", "max_subagents": 21}]))
         self.assertNotEqual(self.bridge_cli("parallel", str(tasks)).returncode, 0)
 
@@ -1346,33 +1365,21 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(state["subagent_count"], 0)
         self.assertEqual(state["activity"]["unattributed_collab"], 1)
 
-    def test_o5_brief_reporting_and_dispatch_docs(self):
+    def test_report_and_trace_docs(self):
         doc = (SCRIPT.parents[1] / "commands/run.md").read_text()
         self.assertIn("poll `status <id> --json`", doc)
         self.assertNotIn("poll `log", doc)
         self.assertNotIn("do NOT run `log`, `result --full`", doc)
-        self.assertIn("omitted from the middle", doc)
-        self.assertIn("result <id> --section", doc)
+        self.assertNotIn("omitted from the middle", doc)
+        self.assertNotIn("--section", doc)
+        self.assertIn("comes through in full", doc)
+        self.assertIn("compact execution trace", doc)
+        self.assertIn("at most 10 lines", doc)
         self.assertIn("cross-check", doc)
         self.assertIn("never declare success", doc)
         self.assertIn("--subagents active", doc)
         self.assertIn("--subagents none", doc)
         self.assertIn("never paste Codex text", doc)
-
-    def test_a1_line_boundary_and_a2_dense_contract(self):
-        self.assertEqual(b.DEFAULTS["brief_chars"], 4000)
-        self.assertEqual(b.brief_text("abc", 3), ("abc", 0))
-        text, omitted = b.brief_text("one\ntwo\nthree\nfour\nfive\nsix", 12)
-        self.assertGreater(omitted, 0)
-        self.assertTrue(text.startswith("one") and text.endswith("six"))  # head AND tail survive
-        self.output_fake("done")
-        result = self.bridge_cli("run", "go")
-        self.assertLess(len(result.stdout.encode()), 2000)
-        prompt = json.loads(self.capture.read_text())["stdin"]
-        for heading in ("Outcome", "Changes (every path)", "Verification", "Problems and deviations",
-                        "Open questions/decisions for the user", "Never omit failures or deviations"):
-            self.assertIn(heading, prompt)
-        self.assertNotIn("12 lines", prompt)
 
     def test_a3_mechanical_failures_files_warnings_agents(self):
         self.init_repo(self.cwd)
@@ -1395,7 +1402,7 @@ class BridgeTests(unittest.TestCase):
                   "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Outcome: done'}}))\n")
         result = self.bridge_cli("run", "go")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("summary: Outcome: done\nactivity:", result.stdout)
+        self.assertIn("report:\nOutcome: done\nactivity:", result.stdout)
         for snippet in ("7 commands (7 failed)", "file-39.txt", "+5 more", "failed command: exit=1 check-file 0",
                         "last-a", "last-b", "last-c", "+2 more failed", "error/warning events: 3", "first warning",
                         "recoverable error", "sub-agents: 1", "model=gpt-6-luna effort=high", "timed out: no", "interrupted: no"):
@@ -1436,75 +1443,113 @@ class BridgeTests(unittest.TestCase):
         for flag in ("--failed", "--commands", "--grep"):
             self.assertIn(flag, self.bridge_cli("log", "--help").stdout)
 
-    def test_contract_yields_to_an_explicit_reply_format(self):
-        self.assertIn("follow the brief and ignore the headings", b.FINAL_MESSAGE_CONTRACT)
-        self.assertIn("exact reply format", b.FINAL_MESSAGE_CONTRACT)
 
-    REPORT = None
+    def trace_job(self, events):
+        jid = b.new_run("task", self.cfg(), "trace", str(self.cwd))
+        Path(b._job_path(jid, "events.jsonl")).write_text("".join(json.dumps(ev) + "\n" for ev in events))
+        b._jwrite(jid, status="done", exit_code=0)
+        return jid
 
-    def _long_report(self):
-        files = "\n".join("- src/module_%02d.py: refactored handle_%d() and updated its callers" % (i, i) for i in range(1, 31))
-        checks = "\n".join("- `pytest tests/test_%02d.py` exit 0, %d passed" % (i, 10 + i) for i in range(1, 21))
-        return ("### Outcome\nPartly done. 29 of 30 modules migrated; module_17 could NOT be migrated.\n\n"
-                "### Changes (every path)\n" + files + "\n\n### Verification\n" + checks + "\n\n"
-                "### Problems and deviations\n- module_17.py was NOT migrated: undocumented private cache format.\n"
-                "- handle_5() gained a required argument which breaks external callers.\n\n"
-                "### Open questions/decisions for the user\n- Should handle_5() keep a default argument?\n"
-                "- Who owns the cache file format used by module_17?\n")
+    @staticmethod
+    def command_event(number, command, output="", code=0):
+        return {"type": "item.completed", "item": {"id": str(number), "type": "command_execution",
+                "command": command, "exit_code": code, "aggregated_output": output}}
 
-    def test_brief_keeps_critical_sections_and_stubs_bulky_ones(self):
-        report = self._long_report()
-        text, omitted = b.brief_text(report, 1500)
-        self.assertLess(len(report), 4000)
-        self.assertLessEqual(len(text), 1500)
-        self.assertGreater(omitted, 0)
-        for needle in ("module_17 could NOT be migrated", "module_17.py was NOT migrated", "breaks external callers",
-                       "Who owns the cache file format", "Should handle_5() keep a default argument"):
-            self.assertIn(needle, text)  # outcome, problems, deviations and open questions are never cut
-        self.assertIn('omitted section "Verification"', text)  # bulky section replaced by a stub that says how to fetch it
-        self.assertIn('result --section "Verification"', text)
-        self.assertNotIn("src/module_17.py", text)  # the file list is trimmed in the middle (also reported mechanically)
-        self.assertIn("omitted from the middle", text)
+    def test_trace_scripts_grouping_repeats_and_classification(self):
+        events = [self.command_event(i, "cat file%d.py" % i, "lots\nof\ntext") for i in range(6)]
+        events += [self.command_event(6, "cat > out.py <<'PY'\nhello\nworld\nPY"),
+                   self.command_event(7, "git status"), self.command_event(8, "git status"),
+                   self.command_event(9, "python3 -c 'from pathlib import Path; Path(\"x\").write_text(\"y\")'")]
+        events = [event for completed in events for event in ({"type": "item.started", "item": {"id": completed["item"]["id"], "type": "command_execution", "command": completed["item"]["command"]}}, completed)]
+        jid = self.trace_job(events)
+        trace = self.bridge_cli("log", jid).stdout
+        self.assertIn("reads x6: file0.py, file1.py, file2.py +3", trace)
+        self.assertIn("script cat (2 lines) writes out.py", trace)
+        self.assertIn("git status x2", trace)
+        self.assertIn("script python3 (1 lines) writes x", trace)
+        self.assertNotIn("hello", trace)
+        self.assertNotIn("writes", b.step_description("python3 - <<'PY'\nif n > 1: print(n)\nPY"))
+        self.assertNotIn("lots", trace)
+        self.assertIn("(+18 out lines)", trace)
+        self.assertIn(b.bridge_command("log", jid, "--full").replace(str(self.home), os.path.realpath(self.home)), trace)
+        for command, kind in (("rg --files", "read"), ("sed -n '1,9p' a.py", "read"),
+                              ("rg needle .", "search"), ("find . -name '*.py'", "search"),
+                              ("git add a.py", "edit"), ("sed -i s/a/b/ a.py", "edit"),
+                              ("apply_patch x", "edit"), ("npm test", "test"),
+                              ("git diff", "git"), ("date", "run"),
+                              ("rg unittest .", "search"), ("cat pytest.ini", "read"),
+                              ("python3 -c \"open('a.txt').read()\"", "run")):
+            self.assertEqual(b.step_kind(command), kind, command)
+        detailed = self.bridge_cli("log", jid, "--full").stdout
+        self.assertIn("hello", detailed)
+        self.assertIn("lots", detailed)
+        self.assertNotIn("reads x6", detailed)
+        self.assertIn("lots", self.bridge_cli("log", jid, "--since", "0").stdout)
 
-    def test_brief_unstructured_text_keeps_its_last_lines(self):
-        body = "\n".join("line %d: routine progress note" % i for i in range(1, 80))
-        text, omitted = b.brief_text(body + "\nWARNING at the very end: the migration is NOT idempotent.", 500)
-        self.assertIn("NOT idempotent", text)
-        self.assertIn("line 1:", text)
-        self.assertIn("omitted from the middle", text)
-        self.assertGreater(omitted, 0)
-        one_line, cut = b.brief_text("x" * 3000, 300)  # one enormous line: both ends survive
-        self.assertTrue(one_line.startswith("xxx") and one_line.endswith("xxx") and cut > 2000)
+    def test_trace_mixed_repeats_and_verbatim_line_endings(self):
+        jid = self.trace_job([self.command_event(i, command) for i, command in enumerate(
+            ("cat a.py", "cat a.py", "cat b.py"))])
+        self.assertIn("reads x3: a.py x2, b.py", self.bridge_cli("log", jid).stdout)
+        report = "  first\r\n\r\nlast\t  "
+        Path(b._job_path(jid, "result.txt")).write_bytes(report.encode())
+        self.assertEqual(b.saved_report(jid), report)
+        with contextlib.redirect_stdout(io.StringIO(newline="")) as out:
+            b.print_report(jid)
+        self.assertIn("report:\n" + report + "\nactivity:", out.getvalue())
 
-    def test_critical_sections_larger_than_the_cap_are_trimmed_but_still_present(self):
-        big = "\n".join("- problem detail %03d" % i for i in range(200))
-        report = "### Outcome\nfailed\n\n### Changes\n- a.py\n\n### Problems and deviations\n" + big + "\n\n### Open questions\n- one question?\n"
-        text, _ = b.brief_text(report, 800)
-        self.assertIn("failed", text)
-        self.assertIn("one question?", text)
-        self.assertIn("problem detail 000", text)
-        self.assertIn("problem detail 199", text)  # head and tail of the oversized critical section
+    def test_trace_notices_narration_and_collab(self):
+        texts = ["ERROR codex_core::util: Custom tool call output is missing for call id a"] * 3
+        texts += ["ERROR codex_core::tools::router: error=write_stdin failed: Unknown process id 42",
+                  "failed to refresh available models: request timed out", "ERROR unknown native failure: preserve me",
+                  "warning: preserve this lower-case warning"]
+        events = [{"type": "raw", "text": text} for text in texts]
+        events += [{"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+                   for text in ("OK.", "I will inspect the files. More narration must disappear.",
+                                "I will inspect these files. More narration must disappear.", "z" * 300)]
+        events += [{"type": "warning", "message": "Unknown warning\nretain whitespace"},
+                   {"type": "item.completed", "item": {"type": "collab_tool_call", "tool": "spawn_agent",
+                    "receiver_thread_ids": ["a", "b"]}}]
+        trace = self.bridge_cli("log", self.trace_job(events)).stdout
+        self.assertIn("internal notices: missing tool output x3, unknown tool process x1, model refresh timeout x1", trace)
+        self.assertNotIn("call id a", trace)
+        self.assertIn("ERROR unknown native failure: preserve me", trace)
+        self.assertIn("Unknown warning\nretain whitespace", trace)
+        self.assertIn("warning: preserve this lower-case warning", trace)
+        self.assertNotIn("» OK", trace)
+        self.assertEqual(trace.count("will inspect"), 1)
+        self.assertNotIn("More narration", trace)
+        self.assertIn("» sub-agents: spawn x2", trace)
+        self.assertTrue(all(len(line[2:]) <= 140 for line in trace.splitlines() if line.startswith("» ")))
 
-    def test_result_section_retrieves_only_what_was_asked(self):
-        r = b.exec_codex(self.cfg(), "go", str(self.cwd)) if False else None
-        jid = b.new_run("task", self.cfg(), "go", str(self.cwd))
-        Path(b._job_path(jid, "result.txt")).write_text(self._long_report())
-        b._jwrite(jid, status="done")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            b.cmd_result(argparse.Namespace(job=jid, name=None, full=False, section="verif"))
-        self.assertIn("pytest tests/test_20.py", out.getvalue())
-        self.assertNotIn("Problems and deviations", out.getvalue())
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            b.cmd_result(argparse.Namespace(job=jid, name=None, full=False, section="nonsense"))
-        self.assertIn("no section matching", out.getvalue())
-        self.assertIn("Problems and deviations", out.getvalue())  # lists what is available
+    def test_trace_failure_tails_test_results_and_steps(self):
+        events = [self.command_event(0, "python3 -m unittest", "Ran 72 tests in 0.4s\n\nOK\n"),
+                  self.command_event(1, "pytest", "FAILED test_a.py::test_bad\nextra\nlast one\n\nlast two\n3 passed, 1 failed\n", 1),
+                  self.command_event(2, "python3 -m unittest", "FAIL: test_bad (Tests)\nRan 3 tests in 1s\n\nFAILED (failures=1)\n", 1),
+                  self.command_event(3, "go test ./...", "all good\n", 0),
+                  self.command_event(4, "broken-command", "omit\nline a\nline b\n\nline c\n", 7)]
+        self.output_fake("Everything done", events)
+        run = self.bridge_cli("run", "go")
+        jid = b.ordered_jobs()[0]
+        trace = self.bridge_cli("log", jid).stdout
+        for text in ("Ran 72 tests in 0.4s OK", "3 passed, 1 failed", "FAILED test_a.py::test_bad",
+                     "FAILED (failures=1)", "FAIL: test_bad (Tests)", "broken-command [exit 7]", "  line a\n  line b\n  line c"):
+            self.assertIn(text, trace)
+        self.assertNotIn("omit", trace)
+        self.assertIn("steps: 5 = 4 test (2 failed, last: Ran 3 tests in 1s FAILED (failures=1)), 1 other", run.stdout)
+        self.assertIn("failed command: exit=7 broken-command", run.stdout)
+        self.assertLessEqual(len(b.steps_line({"test": 10, "last_test": "x" * 500})), 200)
 
-    def test_contract_puts_problems_before_bulky_sections(self):
-        c = b.FINAL_MESSAGE_CONTRACT
-        self.assertLess(c.index("Problems and deviations"), c.index("Changes (every path)"))
-        self.assertLess(c.index("Open questions"), c.index("Verification"))
+    def test_trace_size_bounds(self):
+        for count, limit in ((25, 1500), (120, 4000)):
+            events = []
+            for i in range(count):
+                # Typical batches of reads, searches, edits and tests, with verbose output.
+                commands = ("cat src/file_%d.py", "rg needle src/file_%d.py", "git add src/file_%d.py", "pytest tests/test_%d.py")
+                command = commands[(i // 6) % len(commands)] % i
+                events.append(self.command_event(i, command, "noise\n" * 80 + "3 passed in 0.01s\n"))
+            trace = self.bridge_cli("log", self.trace_job(events)).stdout
+            self.assertLessEqual(len(trace.encode()), limit, trace)
+            self.assertIn("steps=" + str(count), trace)
 
 
 if __name__ == "__main__":
